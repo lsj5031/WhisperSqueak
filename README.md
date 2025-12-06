@@ -1,5 +1,7 @@
 # WhisperSqueak
 
+![WhisperSqueak](WhisperSqueak.png)
+
 A Telegram bot for audio transcription using [Faster Whisper Server](https://github.com/fedirz/faster-whisper-server).
 
 ## Features
