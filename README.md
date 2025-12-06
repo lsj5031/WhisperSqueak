@@ -7,6 +7,9 @@ A Telegram bot for audio transcription using [Faster Whisper Server](https://git
 ## Features
 
 - Transcribe voice messages and audio files (MP3, WAV, OGG, M4A, FLAC, etc.)
+- **Long audio support** - Automatically splits audio into 1-minute chunks with overlap
+- **Progressive display** - See transcription results appear in real-time as chunks complete
+- **Sequential task queue** - Multiple audio files are processed one at a time
 - Dynamic model selection from your Faster Whisper Server
 - Multi-language support with 99+ languages and auto-detection
 - Persistent user settings (model & language preferences)
@@ -95,13 +98,25 @@ Create a `.env` file with the following variables:
 ### Audio Processing
 - All audio formats are converted to MP3 using FFmpeg/pydub before sending to Whisper
 - Supports: MP3, WAV, OGG, M4A, FLAC, AAC, WMA, OPUS, and more
+- **Chunking**: Audio longer than 1 minute is split into chunks with 2-second overlap to avoid cutting words
+- **Progressive results**: Transcription text appears and grows as each chunk completes
+- **Task queue**: Multiple files are queued and processed sequentially to avoid server overload
 
 ## Known Limitations
 
-### No Streaming Transcription
-The OpenAI-compatible API used by Faster Whisper Server does not support true word-by-word streaming for transcription. The bot waits for the complete transcription before displaying results.
+### Telegram File Size Limit (20MB)
+The Telegram Bot API limits file downloads to **20MB**. This affects:
+- Voice messages > 20MB (rare, ~1.5+ hours of Telegram voice)
+- Audio files > 20MB (common for longer recordings)
 
-**Why?** The OpenAI Audio Transcription API (`/v1/audio/transcriptions`) returns the full result in one response. Real-time streaming would require Server-Sent Events (SSE) support, which is not part of the standard API.
+**Estimated file sizes:**
+| Duration | Voice (Opus) | MP3 128kbps | MP3 64kbps |
+|----------|--------------|-------------|------------|
+| 15 min   | ~2MB         | ~14MB       | ~7MB       |
+| 1 hour   | ~8MB         | ~56MB       | ~28MB      |
+| 1.5 hours| ~12MB        | ~85MB       | ~42MB      |
+
+**Workaround**: Use the Telegram Bot API Local Server (see below).
 
 ### Telegram Message Limits
 - Maximum message length is 4096 characters
@@ -110,6 +125,55 @@ The OpenAI-compatible API used by Faster Whisper Server does not support true wo
 ### Button Callback Data Limit
 - Telegram limits callback data to 64 bytes
 - Model names are stored by index to work around this limitation
+
+## Large File Support (Optional)
+
+To transcribe files larger than 20MB, you can run the **Telegram Bot API Local Server**. This removes the file size limit entirely (up to 2GB).
+
+### Setup
+
+1. **Get API credentials** from https://my.telegram.org:
+   - Log in with your phone number
+   - Go to "API development tools"
+   - Create an app to get `api_id` and `api_hash`
+
+2. **Run the Bot API server**:
+   ```bash
+   docker run -d --name telegram-bot-api \
+     -p 8081:8081 \
+     -e TELEGRAM_API_ID=<your_api_id> \
+     -e TELEGRAM_API_HASH=<your_api_hash> \
+     -v /tmp/telegram-bot-api:/var/lib/telegram-bot-api \
+     aiogram/telegram-bot-api
+   ```
+
+3. **Update WhisperSqueak** to use the local server:
+
+   Add to your `.env`:
+   ```
+   TELEGRAM_API_URL=http://localhost:8081
+   ```
+
+   Or if running both in Docker, use:
+   ```
+   TELEGRAM_API_URL=http://host.docker.internal:8081
+   ```
+
+4. **Modify bot.py** (one-line change):
+   ```python
+   # Change this:
+   bot = Bot(token=TOKEN)
+
+   # To this:
+   from aiogram.client.session.aiohttp import AiohttpSession
+   session = AiohttpSession(api=TelegramAPIServer.from_base(os.getenv("TELEGRAM_API_URL", "https://api.telegram.org")))
+   bot = Bot(token=TOKEN, session=session)
+   ```
+
+### Benefits
+- Upload/download files up to 2GB
+- Faster file transfers (direct connection)
+- No changes to bot logic required
 
 ## Docker Networking
 
@@ -175,6 +239,11 @@ WhisperSqueak/
 - Check logs for error messages
 - Ensure FFmpeg is installed (included in Docker image)
 - Verify the file is a supported audio format
+
+### "File is too big" error
+- Telegram Bot API limits downloads to 20MB
+- See [Large File Support](#large-file-support-optional) for the workaround
+- Alternative: Split the audio file before sending
 
 ## License
 

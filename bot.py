@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
 from pydub import AudioSegment
 
 load_dotenv()
@@ -182,10 +182,17 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-client = AsyncOpenAI(
-    base_url=WHISPER_URL,
-    api_key=WHISPER_API_KEY,
-)
+
+@dataclass
+class AudioTask:
+    """Represents a queued audio transcription task."""
+    message: Message
+    file_obj: Any
+    filename: str
+
+
+# Task queue for sequential audio processing
+audio_queue: asyncio.Queue[AudioTask] = asyncio.Queue()
 
 # Cache for available models
 _available_models: list[str] = []
@@ -475,7 +482,9 @@ async def voice_handler(message: Message, state: FSMContext) -> None:
     if not is_allowed(message.from_user.id):
         await message.answer("Access denied. Contact admin.")
         return
-    await process_audio(message, state, message.voice, f"{message.voice.file_id}.ogg")
+    task = AudioTask(message=message, file_obj=message.voice, filename=f"{message.voice.file_id}.ogg")
+    await audio_queue.put(task)
+    print(f"Queued voice task, queue size: {audio_queue.qsize()}", flush=True)
 
 
 @router.message(F.audio)
@@ -486,7 +495,9 @@ async def audio_handler(message: Message, state: FSMContext) -> None:
         return
     audio = message.audio
     filename = audio.file_name or f"{audio.file_id}.mp3"
-    await process_audio(message, state, audio, filename)
+    task = AudioTask(message=message, file_obj=audio, filename=filename)
+    await audio_queue.put(task)
+    print(f"Queued audio task, queue size: {audio_queue.qsize()}", flush=True)
 
 
 @router.message(F.document)
@@ -510,10 +521,41 @@ async def document_handler(message: Message, state: FSMContext) -> None:
         return
 
     filename = doc.file_name or f"{doc.file_id}.audio"
-    await process_audio(message, state, doc, filename)
+    task = AudioTask(message=message, file_obj=doc, filename=filename)
+    await audio_queue.put(task)
+    print(f"Queued document task, queue size: {audio_queue.qsize()}", flush=True)
 
 
-async def process_audio(message: Message, state: FSMContext, file_obj: Any, filename: str) -> None:
+CHUNK_DURATION_MS = 60 * 1000  # 1 minute chunks
+CHUNK_OVERLAP_MS = 2 * 1000   # 2 second overlap to avoid word breaks
+
+
+async def transcribe_audio_chunk(
+    audio_chunk: AudioSegment,
+    model: str,
+    language: str | None,
+) -> str:
+    """Transcribe a single audio chunk using httpx."""
+    mp3_buffer = io.BytesIO()
+    audio_chunk.export(mp3_buffer, format="mp3")
+    mp3_buffer.seek(0)
+
+    form_data = {"model": model, "response_format": "text"}
+    if language:
+        form_data["language"] = language
+
+    async with httpx.AsyncClient(timeout=300) as http:
+        resp = await http.post(
+            f"{WHISPER_URL}/audio/transcriptions",
+            headers={"Authorization": f"Bearer {WHISPER_API_KEY}"},
+            data=form_data,
+            files={"file": ("audio.mp3", mp3_buffer, "audio/mpeg")},
+        )
+        resp.raise_for_status()
+        return resp.text.strip()
+
+
+async def process_audio(message: Message, file_obj: Any, filename: str) -> None:
     uid = message.from_user.id
     print(f"Processing audio for user {uid}: {filename}", flush=True)
 
@@ -525,10 +567,10 @@ async def process_audio(message: Message, state: FSMContext, file_obj: Any, file
     model_short = model.split("/")[-1] if "/" in model else model
     lang_name = SUPPORTED_LANGUAGES.get(lang_display, lang_display)
 
-    status_msg = await message.answer(
+    status_msg = await message.reply(
         f"Processing: {filename}\n"
         f"Model: {model_short}\n"
-        f"Language: {lang_name}"
+        f"Language: {lang_name}",
     )
 
     tg_file = await bot.get_file(file_obj.file_id)
@@ -537,31 +579,67 @@ async def process_audio(message: Message, state: FSMContext, file_obj: Any, file
 
     try:
         audio = AudioSegment.from_file(file_path)
-        mp3_buffer = io.BytesIO()
-        audio.export(mp3_buffer, format="mp3")
-        mp3_buffer.seek(0)
-        file_to_send = ("audio.mp3", mp3_buffer, "audio/mpeg")
+        duration_sec = len(audio) / 1000
+        print(f"Audio duration: {duration_sec:.1f}s", flush=True)
 
-        transcript = await client.audio.transcriptions.create(
-            model=model,
-            file=file_to_send,
-            language=language,
-            response_format="text",
-        )
+        # Split into chunks if longer than 1 minute
+        if len(audio) > CHUNK_DURATION_MS:
+            chunks = []
+            step = CHUNK_DURATION_MS - CHUNK_OVERLAP_MS  # Step with overlap
+            for i in range(0, len(audio), step):
+                chunk_end = min(i + CHUNK_DURATION_MS, len(audio))
+                chunks.append(audio[i:chunk_end])
+                if chunk_end >= len(audio):
+                    break
 
-        result_text = transcript if isinstance(transcript, str) else transcript.text
+            total_chunks = len(chunks)
+            print(f"Split into {total_chunks} chunks", flush=True)
 
-        if not result_text or not result_text.strip():
-            await status_msg.edit_text("No speech detected.")
-        elif len(result_text) > 4000:
-            await status_msg.edit_text(result_text[:4000])
-            remaining = result_text[4000:]
-            while remaining:
-                chunk = remaining[:4000]
-                remaining = remaining[4000:]
-                await message.answer(chunk)
+            # Progressive display - append results as they come
+            current_text = ""
+            current_msg = status_msg
+            all_messages = [status_msg]  # Track all messages for final cleanup
+
+            for i, chunk in enumerate(chunks, 1):
+                chunk_text = await transcribe_audio_chunk(chunk, model, language)
+                if chunk_text:
+                    if current_text:
+                        current_text += " " + chunk_text
+                    else:
+                        current_text = chunk_text
+
+                print(f"Chunk {i}/{total_chunks} done", flush=True)
+
+                # Check if we need to start a new message
+                display_text = current_text + f"\n\n[{i}/{total_chunks}]"
+
+                if len(display_text) <= 4000:
+                    await current_msg.edit_text(display_text)
+                else:
+                    # Finalize current message (remove progress indicator)
+                    await current_msg.edit_text(current_text[:4000] if len(current_text) > 4000 else current_text)
+                    # Start new message with the overflow
+                    current_text = chunk_text  # Start fresh with just this chunk
+                    current_msg = await message.reply(current_text + f"\n\n[{i}/{total_chunks}]")
+                    all_messages.append(current_msg)
+
+            # Final update - remove progress indicator from last message
+            if current_text:
+                final_text = current_text[:4000] if len(current_text) > 4000 else current_text
+                await current_msg.edit_text(final_text)
         else:
-            await status_msg.edit_text(result_text)
+            result_text = await transcribe_audio_chunk(audio, model, language)
+            if not result_text or not result_text.strip():
+                await status_msg.edit_text("No speech detected.")
+            elif len(result_text) > 4000:
+                await status_msg.edit_text(result_text[:4000])
+                remaining = result_text[4000:]
+                while remaining:
+                    chunk = remaining[:4000]
+                    remaining = remaining[4000:]
+                    await message.reply(chunk)
+            else:
+                await status_msg.edit_text(result_text)
 
     except Exception as e:
         print(f"Error processing audio: {e}", flush=True)
@@ -570,11 +648,27 @@ async def process_audio(message: Message, state: FSMContext, file_obj: Any, file
         file_path.unlink(missing_ok=True)
 
 
+async def audio_worker() -> None:
+    """Worker that processes audio tasks from the queue sequentially."""
+    print("Audio worker started", flush=True)
+    while True:
+        task = await audio_queue.get()
+        try:
+            print(f"Processing queued task: {task.filename}", flush=True)
+            await process_audio(task.message, task.file_obj, task.filename)
+        except Exception as e:
+            print(f"Error in audio worker: {e}", flush=True)
+        finally:
+            audio_queue.task_done()
+
+
 async def main() -> None:
     print("WhisperSqueak is starting...", flush=True)
     # Pre-fetch models
     models = await fetch_available_models()
     print(f"Available models: {models}", flush=True)
+    # Start audio worker for sequential processing
+    asyncio.create_task(audio_worker())
     await dp.start_polling(bot)
 
 
