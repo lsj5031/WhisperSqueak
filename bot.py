@@ -2,7 +2,11 @@ import asyncio
 import io
 import json
 import os
-from dataclasses import dataclass
+import time
+import uuid
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +21,111 @@ from dotenv import load_dotenv
 from pydub import AudioSegment
 
 load_dotenv()
+
+
+# Job Queue System
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    RETRY = "retry"
+    FAILED = "failed"
+    COMPLETED = "completed"
+    ARCHIVED = "archived"
+
+
+@dataclass
+class Job:
+    """Represents a transcription job with retry capabilities."""
+    id: str
+    user_id: int
+    chat_id: int
+    message_id: int
+    file_id: str
+    filename: str
+    status: str = JobStatus.PENDING
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    retry_count: int = 0
+    next_retry_at: float | None = None
+    last_error: str | None = None
+    status_message_id: int | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Job":
+        return cls(**data)
+
+
+# Retry configuration
+MAX_RETRIES = 10  # Maximum retry attempts before archiving
+BASE_RETRY_DELAY = 5  # Base delay in seconds (5s)
+MAX_RETRY_DELAY = 3600  # Max delay (1 hour)
+API_DOWN_THRESHOLD = 3600  # 1 hour - if API is down this long, mark as failed
+
+
+def calculate_retry_delay(retry_count: int) -> float:
+    """Calculate exponential backoff delay: 5s, 10s, 20s, 40s, ... up to 1 hour."""
+    delay = BASE_RETRY_DELAY * (2 ** retry_count)
+    return min(delay, MAX_RETRY_DELAY)
+
+
+# Job storage paths
+JOBS_FILE = Path(os.getenv("JOBS_FILE", "/app/jobs.json"))
+ARCHIVE_FILE = Path(os.getenv("ARCHIVE_FILE", "/app/jobs_archive.json"))
+
+
+def load_jobs() -> dict[str, Job]:
+    """Load all jobs from persistent storage."""
+    if JOBS_FILE.exists():
+        try:
+            data = json.loads(JOBS_FILE.read_text())
+            return {k: Job.from_dict(v) for k, v in data.items()}
+        except Exception as e:
+            print(f"Failed to load jobs: {e}", flush=True)
+    return {}
+
+
+def save_jobs(jobs: dict[str, Job]) -> None:
+    """Save all jobs to persistent storage."""
+    try:
+        data = {k: v.to_dict() for k, v in jobs.items()}
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        print(f"Failed to save jobs: {e}", flush=True)
+
+
+def load_archive() -> list[dict]:
+    """Load archived failed jobs."""
+    if ARCHIVE_FILE.exists():
+        try:
+            return json.loads(ARCHIVE_FILE.read_text())
+        except Exception:
+            pass
+    return []
+
+
+def archive_job(job: Job, reason: str) -> None:
+    """Archive a failed job for later inspection."""
+    try:
+        archive = load_archive()
+        archive_entry = job.to_dict()
+        archive_entry["archived_at"] = time.time()
+        archive_entry["archive_reason"] = reason
+        archive.append(archive_entry)
+        ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ARCHIVE_FILE.write_text(json.dumps(archive, indent=2))
+        print(f"Archived job {job.id}: {reason}", flush=True)
+    except Exception as e:
+        print(f"Failed to archive job: {e}", flush=True)
+
+
+# Global job storage
+_jobs: dict[str, Job] = {}
+_api_first_failure_time: float | None = None
+_api_healthy: bool = True
 
 # Persistent storage for user settings
 SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE", "/app/user_settings.json"))
@@ -46,129 +155,23 @@ DEFAULT_MODEL = "Systran/faster-whisper-large-v3"
 def get_user_prefs(user_id: int) -> dict:
     """Get settings for a specific user."""
     settings = load_user_settings()
-    return settings.get(str(user_id), {"model": DEFAULT_MODEL, "language": "auto"})
+    return settings.get(str(user_id), {"model": DEFAULT_MODEL})
 
 
-def set_user_prefs(user_id: int, model: str | None = None, language: str | None = None) -> None:
+def set_user_prefs(user_id: int, model: str | None = None) -> None:
     """Update settings for a specific user."""
     settings = load_user_settings()
     uid = str(user_id)
     if uid not in settings:
-        settings[uid] = {"model": DEFAULT_MODEL, "language": "auto"}
+        settings[uid] = {"model": DEFAULT_MODEL}
     if model is not None:
         settings[uid]["model"] = model
-    if language is not None:
-        settings[uid]["language"] = language
     save_user_settings(settings)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 WHISPER_URL = os.getenv("WHISPER_URL", "http://host.docker.internal:18000/v1")
 WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "dummy")
 ALLOWED_UIDS = [int(uid.strip()) for uid in os.getenv("ALLOWED_UIDS", "").split(",") if uid.strip()]
-
-# Whisper supported languages (ISO 639-1 codes)
-SUPPORTED_LANGUAGES = {
-    "auto": "Auto-detect",
-    "en": "English",
-    "zh": "Chinese",
-    "de": "German",
-    "es": "Spanish",
-    "ru": "Russian",
-    "ko": "Korean",
-    "fr": "French",
-    "ja": "Japanese",
-    "pt": "Portuguese",
-    "tr": "Turkish",
-    "pl": "Polish",
-    "ca": "Catalan",
-    "nl": "Dutch",
-    "ar": "Arabic",
-    "sv": "Swedish",
-    "it": "Italian",
-    "id": "Indonesian",
-    "hi": "Hindi",
-    "fi": "Finnish",
-    "vi": "Vietnamese",
-    "he": "Hebrew",
-    "uk": "Ukrainian",
-    "el": "Greek",
-    "ms": "Malay",
-    "cs": "Czech",
-    "ro": "Romanian",
-    "da": "Danish",
-    "hu": "Hungarian",
-    "ta": "Tamil",
-    "no": "Norwegian",
-    "th": "Thai",
-    "ur": "Urdu",
-    "hr": "Croatian",
-    "bg": "Bulgarian",
-    "lt": "Lithuanian",
-    "la": "Latin",
-    "mi": "Maori",
-    "ml": "Malayalam",
-    "cy": "Welsh",
-    "sk": "Slovak",
-    "te": "Telugu",
-    "fa": "Persian",
-    "lv": "Latvian",
-    "bn": "Bengali",
-    "sr": "Serbian",
-    "az": "Azerbaijani",
-    "sl": "Slovenian",
-    "kn": "Kannada",
-    "et": "Estonian",
-    "mk": "Macedonian",
-    "br": "Breton",
-    "eu": "Basque",
-    "is": "Icelandic",
-    "hy": "Armenian",
-    "ne": "Nepali",
-    "mn": "Mongolian",
-    "bs": "Bosnian",
-    "kk": "Kazakh",
-    "sq": "Albanian",
-    "sw": "Swahili",
-    "gl": "Galician",
-    "mr": "Marathi",
-    "pa": "Punjabi",
-    "si": "Sinhala",
-    "km": "Khmer",
-    "sn": "Shona",
-    "yo": "Yoruba",
-    "so": "Somali",
-    "af": "Afrikaans",
-    "oc": "Occitan",
-    "ka": "Georgian",
-    "be": "Belarusian",
-    "tg": "Tajik",
-    "sd": "Sindhi",
-    "gu": "Gujarati",
-    "am": "Amharic",
-    "yi": "Yiddish",
-    "lo": "Lao",
-    "uz": "Uzbek",
-    "fo": "Faroese",
-    "ht": "Haitian Creole",
-    "ps": "Pashto",
-    "tk": "Turkmen",
-    "nn": "Nynorsk",
-    "mt": "Maltese",
-    "sa": "Sanskrit",
-    "lb": "Luxembourgish",
-    "my": "Myanmar",
-    "bo": "Tibetan",
-    "tl": "Tagalog",
-    "mg": "Malagasy",
-    "as": "Assamese",
-    "tt": "Tatar",
-    "haw": "Hawaiian",
-    "ln": "Lingala",
-    "ha": "Hausa",
-    "ba": "Bashkir",
-    "jw": "Javanese",
-    "su": "Sundanese",
-}
 
 if not TOKEN:
     raise ValueError("TELEGRAM_TOKEN env var required")
@@ -189,10 +192,95 @@ class AudioTask:
     message: Message
     file_obj: Any
     filename: str
+    job_id: str | None = None
 
 
 # Task queue for sequential audio processing
 audio_queue: asyncio.Queue[AudioTask] = asyncio.Queue()
+
+
+def create_job(message: Message, file_obj: Any, filename: str) -> Job:
+    """Create a new job and persist it."""
+    job = Job(
+        id=str(uuid.uuid4()),
+        user_id=message.from_user.id,
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+        file_id=file_obj.file_id,
+        filename=filename,
+    )
+    _jobs[job.id] = job
+    save_jobs(_jobs)
+    print(f"Created job {job.id} for {filename}", flush=True)
+    return job
+
+
+def update_job(job: Job, **kwargs) -> None:
+    """Update job fields and persist."""
+    for key, value in kwargs.items():
+        if hasattr(job, key):
+            setattr(job, key, value)
+    job.updated_at = time.time()
+    save_jobs(_jobs)
+
+
+def complete_job(job: Job) -> None:
+    """Mark job as completed and remove from active jobs."""
+    job.status = JobStatus.COMPLETED
+    job.updated_at = time.time()
+    del _jobs[job.id]
+    save_jobs(_jobs)
+    print(f"Completed job {job.id}", flush=True)
+
+
+def fail_job(job: Job, error: str, should_archive: bool = False) -> None:
+    """Mark job as failed with error details."""
+    job.status = JobStatus.FAILED
+    job.last_error = error
+    job.updated_at = time.time()
+
+    if should_archive:
+        archive_job(job, f"Max retries exceeded: {error}")
+        job.status = JobStatus.ARCHIVED
+        del _jobs[job.id]
+    save_jobs(_jobs)
+    print(f"Failed job {job.id}: {error}", flush=True)
+
+
+def schedule_retry(job: Job, error: str) -> bool:
+    """Schedule a job for retry with exponential backoff. Returns False if max retries exceeded."""
+    job.retry_count += 1
+    job.last_error = error
+
+    if job.retry_count > MAX_RETRIES:
+        fail_job(job, error, should_archive=True)
+        return False
+
+    delay = calculate_retry_delay(job.retry_count)
+    job.next_retry_at = time.time() + delay
+    job.status = JobStatus.RETRY
+    job.updated_at = time.time()
+    save_jobs(_jobs)
+
+    print(f"Scheduled retry {job.retry_count}/{MAX_RETRIES} for job {job.id} in {delay:.0f}s", flush=True)
+    return True
+
+
+def get_pending_jobs() -> list[Job]:
+    """Get jobs that are pending or ready for retry."""
+    now = time.time()
+    ready = []
+    for job in _jobs.values():
+        if job.status == JobStatus.PENDING:
+            ready.append(job)
+        elif job.status == JobStatus.RETRY and job.next_retry_at and job.next_retry_at <= now:
+            ready.append(job)
+    return sorted(ready, key=lambda j: j.created_at)
+
+
+def get_in_progress_jobs() -> list[Job]:
+    """Get jobs currently being processed."""
+    return [j for j in _jobs.values() if j.status == JobStatus.IN_PROGRESS]
 
 # Cache for available models
 _available_models: list[str] = []
@@ -212,17 +300,16 @@ POPULAR_MODELS = [
 
 class UserSettings(StatesGroup):
     selecting_model = State()
-    selecting_language = State()
 
 
 def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_UIDS
 
 
-async def fetch_available_models() -> list[str]:
+async def fetch_available_models(force_refresh: bool = False) -> list[str]:
     """Fetch available models from Whisper server."""
     global _available_models
-    if _available_models:
+    if _available_models and not force_refresh:
         return _available_models
 
     try:
@@ -238,8 +325,10 @@ async def fetch_available_models() -> list[str]:
     except Exception as e:
         print(f"Failed to fetch models: {e}", flush=True)
 
-    # Fallback to common models
-    return POPULAR_MODELS.copy()
+    # Fallback to common models if nothing cached
+    if not _available_models:
+        _available_models = POPULAR_MODELS.copy()
+    return _available_models
 
 
 def get_model_by_index(index: int) -> str | None:
@@ -250,29 +339,29 @@ def get_model_by_index(index: int) -> str | None:
 
 
 def get_filtered_models() -> list[tuple[int, str]]:
-    """Get popular models that are available, with their indices."""
+    """Get available models, with popular ones first."""
     result = []
+    added = set()
+
+    # Add popular models first (if available)
     for popular in POPULAR_MODELS:
         if popular in _available_models:
             idx = _available_models.index(popular)
             result.append((idx, popular))
+            added.add(popular)
+
+    # Add remaining models
+    for idx, model in enumerate(_available_models):
+        if model not in added:
+            result.append((idx, model))
+
     return result
 
 
-def get_user_settings(user_id: int) -> tuple[str, str | None]:
-    """Get model and language from persistent storage."""
+def get_user_model(user_id: int) -> str:
+    """Get model from persistent storage."""
     prefs = get_user_prefs(user_id)
-    model = prefs.get("model", DEFAULT_MODEL)
-    lang = prefs.get("language", "auto")
-    return model, None if lang == "auto" else lang
-
-
-def format_settings(model: str, language: str) -> str:
-    """Format current settings for display."""
-    lang_name = SUPPORTED_LANGUAGES.get(language, language)
-    # Shorten model name for display
-    model_short = model.split("/")[-1] if "/" in model else model
-    return f"Model: {model_short}\nLanguage: {lang_name}"
+    return prefs.get("model", DEFAULT_MODEL)
 
 
 @router.message(Command("start"))
@@ -283,17 +372,11 @@ async def start_handler(message: Message, state: FSMContext) -> None:
         await message.answer("Access denied. Contact admin.")
         return
 
-    prefs = get_user_prefs(uid)
-    model = prefs.get("model", DEFAULT_MODEL)
-    language = prefs.get("language", "auto")
-
     await message.answer(
         "Hi! I'm WhisperSqueak\n\n"
-        "Send a voice message or upload an audio file to transcribe it.\n\n"
-        f"Current settings:\n{format_settings(model, language)}\n\n"
+        "Send a voice message or audio file to transcribe.\n\n"
         "Commands:\n"
         "/model - Select transcription model\n"
-        "/language - Select input language\n"
         "/help - Show help"
     )
 
@@ -304,22 +387,12 @@ async def help_handler(message: Message, state: FSMContext) -> None:
         await message.answer("Access denied. Contact admin.")
         return
 
-    prefs = get_user_prefs(message.from_user.id)
-    model = prefs.get("model", DEFAULT_MODEL)
-    language = prefs.get("language", "auto")
-
     await message.answer(
         "WhisperSqueak - Voice Transcription Bot\n\n"
         "How to use:\n"
         "1. Select a model with /model\n"
-        "2. Select language with /language (or use auto-detect)\n"
-        "3. Send a voice message or audio file\n\n"
-        "Supported formats: MP3, WAV, OGG, M4A, FLAC, etc.\n\n"
-        f"Current settings:\n{format_settings(model, language)}\n\n"
-        "Tips:\n"
-        "- Smaller models (tiny, base) are faster\n"
-        "- Larger models (large-v3) are more accurate\n"
-        "- Setting a specific language improves accuracy"
+        "2. Send a voice message or audio file\n\n"
+        "Supported formats: MP3, WAV, OGG, M4A, FLAC, etc."
     )
 
 
@@ -330,7 +403,11 @@ async def model_command(message: Message, state: FSMContext) -> None:
         return
 
     status = await message.answer("Fetching available models...")
-    await fetch_available_models()
+    await fetch_available_models(force_refresh=True)
+
+    # Get user's current model
+    prefs = get_user_prefs(message.from_user.id)
+    current_model = prefs.get("model", DEFAULT_MODEL)
 
     # Get popular models with their indices
     filtered = get_filtered_models()
@@ -339,6 +416,9 @@ async def model_command(message: Message, state: FSMContext) -> None:
     for idx, model in filtered:
         # Shorten display name
         display = model.split("/")[-1] if "/" in model else model
+        # Mark current selection
+        if model == current_model:
+            display = f"✓ {display}"
         # Use short index-based callback data (e.g., "m:0")
         buttons.append([InlineKeyboardButton(text=display, callback_data=f"m:{idx}")])
 
@@ -376,115 +456,18 @@ async def process_model(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.message(Command("language"))
-async def language_command(message: Message, state: FSMContext) -> None:
-    if not is_allowed(message.from_user.id):
-        await message.answer("Access denied. Contact admin.")
-        return
-
-    # Show common languages first, then a "more" option
-    common_langs = ["auto", "en", "zh", "es", "fr", "de", "ja", "ko", "ru", "pt", "ar", "hi"]
-
-    buttons = []
-    row = []
-    for code in common_langs:
-        name = SUPPORTED_LANGUAGES.get(code, code)
-        row.append(InlineKeyboardButton(text=name, callback_data=f"lang:{code}"))
-        if len(row) == 3:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    buttons.append([InlineKeyboardButton(text="More languages...", callback_data="lang:more")])
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer("Select input language:", reply_markup=keyboard)
-    await state.set_state(UserSettings.selecting_language)
-
-
-@router.callback_query(F.data == "lang:more")
-async def show_more_languages(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_allowed(callback.from_user.id):
-        await callback.answer("Access denied.")
-        return
-
-    # Show all languages in pages
-    common = {"auto", "en", "zh", "es", "fr", "de", "ja", "ko", "ru", "pt", "ar", "hi"}
-    other_langs = [(k, v) for k, v in SUPPORTED_LANGUAGES.items() if k not in common]
-    other_langs.sort(key=lambda x: x[1])  # Sort by name
-
-    buttons = []
-    row = []
-    for code, name in other_langs[:30]:  # First 30 additional languages
-        row.append(InlineKeyboardButton(text=name, callback_data=f"lang:{code}"))
-        if len(row) == 3:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    buttons.append([InlineKeyboardButton(text="Back", callback_data="lang:back")])
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text("Select language:", reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "lang:back")
-async def back_to_common_languages(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_allowed(callback.from_user.id):
-        await callback.answer("Access denied.")
-        return
-
-    common_langs = ["auto", "en", "zh", "es", "fr", "de", "ja", "ko", "ru", "pt", "ar", "hi"]
-
-    buttons = []
-    row = []
-    for code in common_langs:
-        name = SUPPORTED_LANGUAGES.get(code, code)
-        row.append(InlineKeyboardButton(text=name, callback_data=f"lang:{code}"))
-        if len(row) == 3:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    buttons.append([InlineKeyboardButton(text="More languages...", callback_data="lang:more")])
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text("Select input language:", reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("lang:"))
-async def process_language(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_allowed(callback.from_user.id):
-        await callback.answer("Access denied.")
-        return
-
-    lang_code = callback.data.split(":", 1)[1]
-    if lang_code in ("more", "back"):
-        return  # Handled by other handlers
-
-    # Save to persistent storage
-    set_user_prefs(callback.from_user.id, language=lang_code)
-
-    lang_name = SUPPORTED_LANGUAGES.get(lang_code, lang_code)
-    await callback.message.edit_text(f"Language set to: {lang_name}\n\nSend a voice or audio file to transcribe!")
-    await state.set_state(None)
-    await callback.answer()
-
-
 @router.message(F.voice)
 async def voice_handler(message: Message, state: FSMContext) -> None:
     print(f"Received voice from {message.from_user.id}", flush=True)
     if not is_allowed(message.from_user.id):
         await message.answer("Access denied. Contact admin.")
         return
-    task = AudioTask(message=message, file_obj=message.voice, filename=f"{message.voice.file_id}.ogg")
+
+    filename = f"{message.voice.file_id}.ogg"
+    job = create_job(message, message.voice, filename)
+    task = AudioTask(message=message, file_obj=message.voice, filename=filename, job_id=job.id)
     await audio_queue.put(task)
-    print(f"Queued voice task, queue size: {audio_queue.qsize()}", flush=True)
+    print(f"Queued voice task (job: {job.id}), queue size: {audio_queue.qsize()}", flush=True)
 
 
 @router.message(F.audio)
@@ -493,11 +476,13 @@ async def audio_handler(message: Message, state: FSMContext) -> None:
     if not is_allowed(message.from_user.id):
         await message.answer("Access denied. Contact admin.")
         return
+
     audio = message.audio
     filename = audio.file_name or f"{audio.file_id}.mp3"
-    task = AudioTask(message=message, file_obj=audio, filename=filename)
+    job = create_job(message, audio, filename)
+    task = AudioTask(message=message, file_obj=audio, filename=filename, job_id=job.id)
     await audio_queue.put(task)
-    print(f"Queued audio task, queue size: {audio_queue.qsize()}", flush=True)
+    print(f"Queued audio task (job: {job.id}), queue size: {audio_queue.qsize()}", flush=True)
 
 
 @router.message(F.document)
@@ -521,58 +506,148 @@ async def document_handler(message: Message, state: FSMContext) -> None:
         return
 
     filename = doc.file_name or f"{doc.file_id}.audio"
-    task = AudioTask(message=message, file_obj=doc, filename=filename)
+    job = create_job(message, doc, filename)
+    task = AudioTask(message=message, file_obj=doc, filename=filename, job_id=job.id)
     await audio_queue.put(task)
-    print(f"Queued document task, queue size: {audio_queue.qsize()}", flush=True)
+    print(f"Queued document task (job: {job.id}), queue size: {audio_queue.qsize()}", flush=True)
 
 
 CHUNK_DURATION_MS = 60 * 1000  # 1 minute chunks
 CHUNK_OVERLAP_MS = 2 * 1000   # 2 second overlap to avoid word breaks
 
 
+class APIError(Exception):
+    """Custom exception for API errors that may warrant retry."""
+    def __init__(self, message: str, is_retryable: bool = True):
+        super().__init__(message)
+        self.is_retryable = is_retryable
+
+
+async def check_api_health() -> bool:
+    """Check if the Whisper API is responsive."""
+    global _api_healthy, _api_first_failure_time
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.get(f"{WHISPER_URL}/models")
+            if resp.status_code == 200:
+                _api_healthy = True
+                _api_first_failure_time = None
+                return True
+    except Exception as e:
+        print(f"API health check failed: {e}", flush=True)
+
+    # Track first failure time
+    if _api_first_failure_time is None:
+        _api_first_failure_time = time.time()
+
+    _api_healthy = False
+    return False
+
+
+def is_api_down_too_long() -> bool:
+    """Check if API has been down longer than threshold (1 hour)."""
+    if _api_first_failure_time is None:
+        return False
+    return (time.time() - _api_first_failure_time) >= API_DOWN_THRESHOLD
+
+
 async def transcribe_audio_chunk(
     audio_chunk: AudioSegment,
     model: str,
-    language: str | None,
 ) -> str:
     """Transcribe a single audio chunk using httpx."""
+    global _api_healthy, _api_first_failure_time
+
     mp3_buffer = io.BytesIO()
     audio_chunk.export(mp3_buffer, format="mp3")
     mp3_buffer.seek(0)
 
     form_data = {"model": model, "response_format": "json"}
-    if language:
-        form_data["language"] = language
 
-    async with httpx.AsyncClient(timeout=300) as http:
-        resp = await http.post(
-            f"{WHISPER_URL}/audio/transcriptions",
-            headers={"Authorization": f"Bearer {WHISPER_API_KEY}"},
-            data=form_data,
-            files={"file": ("audio.mp3", mp3_buffer, "audio/mpeg")},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("text", "").strip()
+    try:
+        async with httpx.AsyncClient(timeout=300) as http:
+            resp = await http.post(
+                f"{WHISPER_URL}/audio/transcriptions",
+                headers={"Authorization": f"Bearer {WHISPER_API_KEY}"},
+                data=form_data,
+                files={"file": ("audio.mp3", mp3_buffer, "audio/mpeg")},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # API is healthy
+            _api_healthy = True
+            _api_first_failure_time = None
+
+            return data.get("text", "").strip()
+
+    except httpx.ConnectError as e:
+        raise APIError(f"Connection failed: {e}", is_retryable=True)
+    except httpx.TimeoutException as e:
+        raise APIError(f"Request timeout: {e}", is_retryable=True)
+    except httpx.HTTPStatusError as e:
+        # 5xx errors are retryable, 4xx are not (except 429)
+        if e.response.status_code >= 500 or e.response.status_code == 429:
+            raise APIError(f"Server error {e.response.status_code}: {e}", is_retryable=True)
+        else:
+            raise APIError(f"Client error {e.response.status_code}: {e}", is_retryable=False)
+    except Exception as e:
+        raise APIError(f"Unexpected error: {e}", is_retryable=True)
 
 
-async def process_audio(message: Message, file_obj: Any, filename: str) -> None:
+async def process_audio(message: Message, file_obj: Any, filename: str, job: Job | None = None) -> None:
     uid = message.from_user.id
     print(f"Processing audio for user {uid}: {filename}", flush=True)
 
-    model, language = get_user_settings(uid)
-    prefs = get_user_prefs(uid)
-    lang_display = prefs.get("language", "auto")
-    print(f"Settings - model: {model}, language: {language}", flush=True)
+    model = get_user_model(uid)
+    print(f"Settings - model: {model}", flush=True)
 
     model_short = model.split("/")[-1] if "/" in model else model
-    lang_name = SUPPORTED_LANGUAGES.get(lang_display, lang_display)
 
-    status_msg = await message.reply(
-        f"Processing: {filename}\n"
-        f"Model: {model_short}\n"
-        f"Language: {lang_name}",
-    )
+    # Create or retrieve status message
+    retry_info = ""
+    if job and job.retry_count > 0:
+        retry_info = f"\nRetry attempt: {job.retry_count}/{MAX_RETRIES}"
+
+    if job and job.status_message_id:
+        # Try to edit existing status message
+        try:
+            status_msg = await bot.edit_message_text(
+                f"Processing: {filename}\n"
+                f"Model: {model_short}{retry_info}",
+                chat_id=message.chat.id,
+                message_id=job.status_message_id,
+            )
+            # Create a mock message object with the message_id for editing
+            class StatusMessage:
+                def __init__(self, chat_id: int, message_id: int):
+                    self.chat = type('obj', (object,), {'id': chat_id})()
+                    self.message_id = message_id
+
+                async def edit_text(self, text: str):
+                    await bot.edit_message_text(text, chat_id=self.chat.id, message_id=self.message_id)
+
+            status_msg = StatusMessage(message.chat.id, job.status_message_id)
+        except Exception:
+            # Message might be deleted, create new one
+            status_msg = await message.reply(
+                f"Processing: {filename}\n"
+                f"Model: {model_short}{retry_info}",
+            )
+            if job:
+                update_job(job, status_message_id=status_msg.message_id)
+    else:
+        status_msg = await message.reply(
+            f"Processing: {filename}\n"
+            f"Model: {model_short}{retry_info}",
+        )
+        if job:
+            update_job(job, status_message_id=status_msg.message_id)
+
+    # Mark job as in progress
+    if job:
+        update_job(job, status=JobStatus.IN_PROGRESS)
 
     tg_file = await bot.get_file(file_obj.file_id)
     file_path = Path(f"/tmp/{tg_file.file_id}")
@@ -602,7 +677,7 @@ async def process_audio(message: Message, file_obj: Any, filename: str) -> None:
             all_messages = [status_msg]  # Track all messages for final cleanup
 
             for i, chunk in enumerate(chunks, 1):
-                chunk_text = await transcribe_audio_chunk(chunk, model, language)
+                chunk_text = await transcribe_audio_chunk(chunk, model)
                 if chunk_text:
                     if current_text:
                         current_text += " " + chunk_text
@@ -629,7 +704,7 @@ async def process_audio(message: Message, file_obj: Any, filename: str) -> None:
                 final_text = current_text[:4000] if len(current_text) > 4000 else current_text
                 await current_msg.edit_text(final_text)
         else:
-            result_text = await transcribe_audio_chunk(audio, model, language)
+            result_text = await transcribe_audio_chunk(audio, model)
             if not result_text or not result_text.strip():
                 await status_msg.edit_text("No speech detected.")
             elif len(result_text) > 4000:
@@ -642,11 +717,77 @@ async def process_audio(message: Message, file_obj: Any, filename: str) -> None:
             else:
                 await status_msg.edit_text(result_text)
 
+        # Job completed successfully
+        if job:
+            complete_job(job)
+
+    except APIError as e:
+        print(f"API error processing audio: {e}", flush=True)
+        if job:
+            if e.is_retryable:
+                # Check if API has been down too long
+                if is_api_down_too_long():
+                    fail_job(job, f"API down for over 1 hour: {e}", should_archive=True)
+                    await status_msg.edit_text(
+                        f"Transcription failed - API unavailable for over 1 hour.\n"
+                        f"Job archived. Error: {str(e)[:200]}"
+                    )
+                elif schedule_retry(job, str(e)):
+                    delay = calculate_retry_delay(job.retry_count)
+                    await status_msg.edit_text(
+                        f"API error, will retry in {format_delay(delay)}.\n"
+                        f"Attempt {job.retry_count}/{MAX_RETRIES}\n"
+                        f"Error: {str(e)[:200]}"
+                    )
+                else:
+                    # Max retries exceeded
+                    await status_msg.edit_text(
+                        f"Transcription failed after {MAX_RETRIES} attempts.\n"
+                        f"Job archived. Last error: {str(e)[:200]}"
+                    )
+            else:
+                fail_job(job, str(e), should_archive=True)
+                await status_msg.edit_text(
+                    f"Transcription failed (non-retryable error).\n"
+                    f"Error: {str(e)[:200]}"
+                )
+        else:
+            await status_msg.edit_text(f"Error processing {filename}:\n{str(e)}")
+        raise  # Re-raise for the worker to handle
+
     except Exception as e:
         print(f"Error processing audio: {e}", flush=True)
-        await status_msg.edit_text(f"Error processing {filename}:\n{str(e)}")
+        if job:
+            if schedule_retry(job, str(e)):
+                delay = calculate_retry_delay(job.retry_count)
+                await status_msg.edit_text(
+                    f"Error occurred, will retry in {format_delay(delay)}.\n"
+                    f"Attempt {job.retry_count}/{MAX_RETRIES}\n"
+                    f"Error: {str(e)[:200]}"
+                )
+            else:
+                await status_msg.edit_text(
+                    f"Transcription failed after {MAX_RETRIES} attempts.\n"
+                    f"Job archived. Last error: {str(e)[:200]}"
+                )
+        else:
+            await status_msg.edit_text(f"Error processing {filename}:\n{str(e)}")
+        raise  # Re-raise for the worker to handle
+
     finally:
         file_path.unlink(missing_ok=True)
+
+
+def format_delay(seconds: float) -> str:
+    """Format delay in human-readable format."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        return f"{int(seconds / 60)}m {int(seconds % 60)}s"
+    else:
+        hours = int(seconds / 3600)
+        minutes = int((seconds % 3600) / 60)
+        return f"{hours}h {minutes}m"
 
 
 async def audio_worker() -> None:
@@ -655,21 +796,110 @@ async def audio_worker() -> None:
     while True:
         task = await audio_queue.get()
         try:
-            print(f"Processing queued task: {task.filename}", flush=True)
-            await process_audio(task.message, task.file_obj, task.filename)
-        except Exception as e:
-            print(f"Error in audio worker: {e}", flush=True)
+            print(f"Processing queued task: {task.filename} (job: {task.job_id})", flush=True)
+
+            # Get job if exists
+            job = _jobs.get(task.job_id) if task.job_id else None
+
+            await process_audio(task.message, task.file_obj, task.filename, job)
+        except (APIError, Exception) as e:
+            # Errors are already handled in process_audio with retry scheduling
+            print(f"Error in audio worker (handled): {e}", flush=True)
         finally:
             audio_queue.task_done()
 
 
+async def retry_scheduler() -> None:
+    """Background task that checks for jobs ready for retry and re-queues them."""
+    print("Retry scheduler started", flush=True)
+
+    while True:
+        await asyncio.sleep(5)  # Check every 5 seconds
+
+        try:
+            pending_jobs = get_pending_jobs()
+
+            for job in pending_jobs:
+                # Skip if already in queue or being processed
+                if job.status == JobStatus.IN_PROGRESS:
+                    continue
+
+                print(f"Re-queuing job {job.id} for retry (attempt {job.retry_count})", flush=True)
+
+                # Create a mock message for re-processing
+                # We need to reconstruct enough context to process the job
+                class MockMessage:
+                    def __init__(self, job: Job):
+                        self.from_user = type('obj', (object,), {'id': job.user_id})()
+                        self.chat = type('obj', (object,), {'id': job.chat_id})()
+                        self.message_id = job.message_id
+
+                    async def reply(self, text: str):
+                        return await bot.send_message(self.chat.id, text, reply_to_message_id=self.message_id)
+
+                class MockFileObj:
+                    def __init__(self, file_id: str):
+                        self.file_id = file_id
+
+                mock_message = MockMessage(job)
+                mock_file = MockFileObj(job.file_id)
+
+                task = AudioTask(
+                    message=mock_message,
+                    file_obj=mock_file,
+                    filename=job.filename,
+                    job_id=job.id,
+                )
+                await audio_queue.put(task)
+
+        except Exception as e:
+            print(f"Error in retry scheduler: {e}", flush=True)
+
+
+async def recover_jobs() -> None:
+    """Recover pending and in-progress jobs on bot restart."""
+    global _jobs
+
+    _jobs = load_jobs()
+    recovered = 0
+
+    for job_id, job in list(_jobs.items()):
+        # Reset in-progress jobs to pending (they were interrupted)
+        if job.status == JobStatus.IN_PROGRESS:
+            job.status = JobStatus.RETRY
+            job.retry_count += 1
+            if job.retry_count > MAX_RETRIES:
+                archive_job(job, "Max retries exceeded after restart recovery")
+                del _jobs[job_id]
+                continue
+            job.next_retry_at = time.time() + calculate_retry_delay(job.retry_count)
+            print(f"Reset interrupted job {job.id} to retry", flush=True)
+
+        # Jobs in retry status will be picked up by retry_scheduler
+        if job.status in (JobStatus.PENDING, JobStatus.RETRY):
+            recovered += 1
+            print(f"Recovered job {job.id} ({job.filename}) - status: {job.status}", flush=True)
+
+    save_jobs(_jobs)
+    print(f"Recovered {recovered} jobs from previous session", flush=True)
+
+
 async def main() -> None:
     print("WhisperSqueak is starting...", flush=True)
+
+    # Recover any pending jobs from previous session
+    await recover_jobs()
+
     # Pre-fetch models
     models = await fetch_available_models()
     print(f"Available models: {models}", flush=True)
+
     # Start audio worker for sequential processing
     asyncio.create_task(audio_worker())
+
+    # Start retry scheduler for exponential backoff retries
+    asyncio.create_task(retry_scheduler())
+
     await dp.start_polling(bot)
 
 
