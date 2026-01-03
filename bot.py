@@ -17,8 +17,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
+from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 from pydub import AudioSegment
+
+from sse_parser import SSEParser, SSEParseResult
 
 load_dotenv()
 
@@ -63,6 +66,11 @@ MAX_RETRIES = 10  # Maximum retry attempts before archiving
 BASE_RETRY_DELAY = 5  # Base delay in seconds (5s)
 MAX_RETRY_DELAY = 3600  # Max delay (1 hour)
 API_DOWN_THRESHOLD = 3600  # 1 hour - if API is down this long, mark as failed
+
+# Transcription configuration
+TELEGRAM_MESSAGE_LIMIT = 4000  # Telegram's max message length
+MESSAGE_UPDATE_THROTTLE_SEC = 1.0  # Min interval between streaming message updates
+PENDING_JOB_GRACE_PERIOD_SEC = 60  # Grace period before retry scheduler picks up pending jobs
 
 
 def calculate_retry_delay(retry_count: int) -> float:
@@ -272,9 +280,9 @@ def get_pending_jobs() -> list[Job]:
     ready = []
     for job in _jobs.values():
         if job.status == JobStatus.PENDING:
-            # Only pick up pending jobs if they've been pending for > 60s
+            # Only pick up pending jobs if they've been pending longer than grace period
             # This prevents race conditions with the initial queueing
-            if (now - job.created_at) > 60:
+            if (now - job.created_at) > PENDING_JOB_GRACE_PERIOD_SEC:
                 ready.append(job)
         elif job.status == JobStatus.RETRY and job.next_retry_at and job.next_retry_at <= now:
             ready.append(job)
@@ -564,7 +572,37 @@ async def transcribe_audio_chunk(
     audio_chunk: AudioSegment,
     model: str,
 ) -> AsyncGenerator[str, None]:
-    """Transcribe a single audio chunk using SSE streaming and yield accumulated text."""
+    """Transcribe a single audio chunk using SSE streaming and yield accumulated text.
+    
+    Expected SSE Protocol from Backend:
+    ----------------------------------
+    The backend should send Server-Sent Events (SSE) with the following format:
+    
+    Content-Type: text/event-stream
+    
+    Events:
+    - Progress updates: `data: {"data": "transcribed text segment"}`
+      OR raw text:      `data: transcribed text segment`
+    - Completion:       `data: [DONE]`
+    - Errors:           `data: [Error: error message here]`
+    
+    Example stream:
+        data: {"data": "Hello, "}
+        data: {"data": "world!"}
+        data: [DONE]
+    
+    OR (for backends like glm-asr that send raw text):
+        data: Hello, 
+        data: world!
+        data: [DONE]
+    
+    Notes:
+    - Each event is on its own line, prefixed with "data: "
+    - Events are separated by newlines
+    - JSON format is preferred but raw text is accepted as fallback
+    - The function yields accumulated text (not incremental), so callers 
+      can display the full transcription at any point
+    """
     global _api_healthy, _api_first_failure_time
 
     mp3_buffer = io.BytesIO()
@@ -588,71 +626,33 @@ async def transcribe_audio_chunk(
                 _api_healthy = True
                 _api_first_failure_time = None
 
-                # Accumulate text from SSE stream
-                accumulated_text = ""
-                buffer = ""
+                # Use SSEParser to handle the streaming response
+                parser = SSEParser()
 
                 async for chunk in resp.aiter_text():
-                    buffer += chunk
-
-                    # Split by newlines to get SSE events
-                    lines = buffer.split("\n")
-                    buffer = lines[-1]  # Keep incomplete line in buffer
-
-                    for line in lines[:-1]:
-                        line = line.strip()
-                        if not line or not line.startswith("data:"):
-                            continue
-
-                        # Extract data value
-                        data_str = line[5:].strip()
-
-                        # Check for completion sentinel
-                        if data_str == "[DONE]":
-                            yield accumulated_text.strip()
+                    results = parser.feed(chunk)
+                    
+                    for result in results:
+                        if result.error:
+                            raise APIError(f"Transcription error: {result.error}", is_retryable=True)
+                        
+                        if result.is_done:
+                            yield parser.get_text()
                             return
+                        
+                        # Yield current accumulated text for streaming updates
+                        if result.accumulated_text:
+                            yield result.accumulated_text.strip()
 
-                        # Check for error sentinel
-                        if data_str.startswith("[Error:"):
-                            error_start = len("[Error:")
-                            error_msg = data_str[error_start:]
-                            # Remove trailing ] if present
-                            if error_msg.endswith("]"):
-                                error_msg = error_msg[:-1]
-                            raise APIError(f"Transcription error: {error_msg}", is_retryable=True)
+                # Handle any remaining buffer content
+                final_result = parser.finalize()
+                if final_result:
+                    if final_result.error:
+                        raise APIError(f"Transcription error: {final_result.error}", is_retryable=True)
+                    if not final_result.is_done and final_result.accumulated_text:
+                        yield final_result.accumulated_text.strip()
 
-                        # Parse JSON data
-                        try:
-                            data = json.loads(data_str)
-                            text = data.get("data", "")
-                            if text:
-                                accumulated_text += text
-                                yield accumulated_text.strip()
-                        except json.JSONDecodeError:
-                            # If not JSON, treat raw data as text
-                            accumulated_text += data_str
-                            yield accumulated_text.strip()
-
-                # Handle any remaining buffer content (shouldn't happen with proper SSE stream)
-                if buffer.strip():
-                    line = buffer.strip()
-                    if line.startswith("data:"):
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
-                            yield accumulated_text.strip()
-                            return
-                        if not data_str.startswith("[Error:"):
-                            try:
-                                data = json.loads(data_str)
-                                text = data.get("data", "")
-                                if text:
-                                    accumulated_text += text
-                            except json.JSONDecodeError:
-                                accumulated_text += data_str
-                            
-                            yield accumulated_text.strip()
-
-                yield accumulated_text.strip()
+                yield parser.get_text()
 
     except httpx.ConnectError as e:
         raise APIError(f"Connection failed: {e}", is_retryable=True)
@@ -730,54 +730,85 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
         duration_sec = len(audio) / 1000
         print(f"Audio duration: {duration_sec:.1f}s", flush=True)
 
-        result_text = ""
+        # Track all messages for multi-message streaming
+        all_messages = [status_msg]  # List of message objects
+        finalized_length = 0  # Length of text in completed (full) messages
         last_update_time = 0
+        full_text = ""  # Complete accumulated text
         
         async for partial_text in transcribe_audio_chunk(audio, model):
-            result_text = partial_text
+            full_text = partial_text
+            # Calculate what goes in current message (text after finalized portion)
+            current_msg_text = partial_text[finalized_length:]
             
-            # Throttle updates
-            now = time.time()
-            if now - last_update_time >= 1.0:
+            # Check if we need to split into a new message
+            while len(current_msg_text) > TELEGRAM_MESSAGE_LIMIT:
+                # Find split point at word boundary
+                split_idx = current_msg_text.rfind(" ", 0, TELEGRAM_MESSAGE_LIMIT)
+                if split_idx == -1:
+                    split_idx = TELEGRAM_MESSAGE_LIMIT
+                
+                # Finalize the current message with the first part
+                finalized_chunk = current_msg_text[:split_idx]
                 try:
-                    # Only update if <= 4000 to avoid errors during streaming
-                    if len(result_text) <= 4000:
-                        await status_msg.edit_text(result_text)
-                except Exception:
+                    await all_messages[-1].edit_text(finalized_chunk)
+                except TelegramBadRequest:
                     pass
+                
+                # Track how much text is now finalized
+                finalized_length += split_idx
+                
+                # Get remaining text for new message
+                current_msg_text = current_msg_text[split_idx:].lstrip()
+                # Recalculate finalized_length based on current position in full text.
+                # After lstrip(), we may have removed whitespace, so we can't just add
+                # split_idx to finalized_length. Instead, compute how much of partial_text
+                # is NOT in current_msg_text - that's everything that's been finalized.
+                finalized_length = len(partial_text) - len(current_msg_text)
+                
+                # Create new message for overflow
+                if current_msg_text:
+                    try:
+                        new_msg = await message.reply(current_msg_text + " ⏳")
+                        all_messages.append(new_msg)
+                    except TelegramBadRequest as e:
+                        # Failed to create new message, log and continue with existing messages
+                        print(f"Failed to create new message for overflow: {e}", flush=True)
+            
+            # Throttle updates on current message
+            now = time.time()
+            if now - last_update_time >= MESSAGE_UPDATE_THROTTLE_SEC and current_msg_text:
+                try:
+                    # Show streaming indicator on current message
+                    display_text = current_msg_text + " ⏳" if len(current_msg_text) < TELEGRAM_MESSAGE_LIMIT - 10 else current_msg_text
+                    await all_messages[-1].edit_text(display_text)
+                except TelegramBadRequest:
+                    pass  # Message not modified or other Telegram API error
                 last_update_time = now
         
-        # Final result handling
-        if not result_text or not result_text.strip():
-            await status_msg.edit_text("No speech detected.")
-        elif len(result_text) > 4000:
-            # Smart split by nearest whitespace to avoid cutting words
-            chunks = []
-            text_to_process = result_text
-            while len(text_to_process) > 4000:
-                # Find nearest space before limit (reserve a bit of buffer)
-                split_idx = text_to_process.rfind(" ", 0, 4000)
-                if split_idx == -1:
-                    # No space found, force split at limit
-                    split_idx = 4000
-                
-                chunks.append(text_to_process[:split_idx])
-                text_to_process = text_to_process[split_idx:].strip()
-            
-            if text_to_process:
-                chunks.append(text_to_process)
-
-            # Update the status message with first part
-            await status_msg.edit_text(chunks[0])
-            
-            # Send remaining parts as new messages
-            for chunk in chunks[1:]:
-                await message.reply(chunk)
-        else:
+        # Final result handling - get final current message text
+        final_current_text = full_text[finalized_length:] if full_text else ""
+        
+        if finalized_length == 0 and not final_current_text.strip():
+            await all_messages[-1].edit_text("No speech detected.")
+        elif final_current_text.strip():
+            # Update the last message with final text (remove streaming indicator)
             try:
-                await status_msg.edit_text(result_text)
-            except Exception:
-                pass # Ignore if message not modified
+                await all_messages[-1].edit_text(final_current_text.strip())
+            except TelegramBadRequest:
+                pass  # Ignore if message not modified
+        elif finalized_length > 0 and len(all_messages) > 1:
+            # Edge case: transcription exactly filled previous message(s), leaving
+            # current message empty or whitespace-only. The last message was created
+            # with overflow text + streaming indicator, but after lstrip the final 
+            # segment is empty. Delete the empty trailing message.
+            try:
+                await bot.delete_message(
+                    chat_id=all_messages[-1].chat.id,
+                    message_id=all_messages[-1].message_id
+                )
+            except TelegramBadRequest:
+                pass  # Message already deleted or can't be deleted
 
         # Job completed successfully
         if job:
