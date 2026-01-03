@@ -556,14 +556,14 @@ async def transcribe_audio_chunk(
     audio_chunk: AudioSegment,
     model: str,
 ) -> str:
-    """Transcribe a single audio chunk using SSE streaming."""
+    """Transcribe a single audio chunk using SSE streaming and return complete text."""
     global _api_healthy, _api_first_failure_time
 
     mp3_buffer = io.BytesIO()
     audio_chunk.export(mp3_buffer, format="mp3")
     mp3_buffer.seek(0)
 
-    form_data = {"model": model, "stream": "true"}
+    form_data = {"model": model, "response_format": "json", "stream": "true"}
 
     try:
         async with httpx.AsyncClient(timeout=300) as http:
@@ -605,7 +605,11 @@ async def transcribe_audio_chunk(
 
                         # Check for error sentinel
                         if data_str.startswith("[Error:"):
-                            error_msg = data_str[7:-1] if data_str.endswith("]") else data_str[7:]
+                            error_start = len("[Error:")
+                            error_msg = data_str[error_start:]
+                            # Remove trailing ] if present
+                            if error_msg.endswith("]"):
+                                error_msg = error_msg[:-1]
                             raise APIError(f"Transcription error: {error_msg}", is_retryable=True)
 
                         # Parse JSON data
@@ -617,6 +621,22 @@ async def transcribe_audio_chunk(
                         except json.JSONDecodeError as e:
                             print(f"Failed to parse SSE data: {data_str}, error: {e}", flush=True)
                             continue
+
+                # Handle any remaining buffer content (shouldn't happen with proper SSE stream)
+                if buffer.strip():
+                    line = buffer.strip()
+                    if line.startswith("data:"):
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            return accumulated_text.strip()
+                        if not data_str.startswith("[Error:"):
+                            try:
+                                data = json.loads(data_str)
+                                text = data.get("data", "")
+                                if text:
+                                    accumulated_text += text
+                            except json.JSONDecodeError:
+                                pass
 
                 return accumulated_text.strip()
 
