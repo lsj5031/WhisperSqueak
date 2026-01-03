@@ -1,0 +1,18 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/DetachHead/basedpyright-pre-commit-mirror
+    rev: 1.36.2
+    hooks:
+      - id: basedpyright
+        name: pyright
+        additional_dependencies:
+          - aiogram>=3.13.1
+          - httpx>=0.27.0
+          - pydub>=0.25.1
+          - python-dotenv>=1.0.1

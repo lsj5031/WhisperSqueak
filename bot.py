@@ -4,24 +4,24 @@ import json
 import os
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from collections.abc import AsyncGenerator
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any
 
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 from pydub import AudioSegment
 
-from sse_parser import SSEParser, SSEParseResult
+from sse_parser import SSEParser
 
 load_dotenv()
 
@@ -39,6 +39,7 @@ class JobStatus(str, Enum):
 @dataclass
 class Job:
     """Represents a transcription job with retry capabilities."""
+
     id: str
     user_id: int
     chat_id: int
@@ -75,7 +76,7 @@ PENDING_JOB_GRACE_PERIOD_SEC = 60  # Grace period before retry scheduler picks u
 
 def calculate_retry_delay(retry_count: int) -> float:
     """Calculate exponential backoff delay: 5s, 10s, 20s, 40s, ... up to 1 hour."""
-    delay = BASE_RETRY_DELAY * (2 ** retry_count)
+    delay = BASE_RETRY_DELAY * (2**retry_count)
     return min(delay, MAX_RETRY_DELAY)
 
 
@@ -176,6 +177,7 @@ def set_user_prefs(user_id: int, model: str | None = None) -> None:
         settings[uid]["model"] = model
     save_user_settings(settings)
 
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 WHISPER_URL = os.getenv("WHISPER_URL", "http://host.docker.internal:18000/v1")
 WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "dummy")
@@ -197,6 +199,7 @@ dp.include_router(router)
 @dataclass
 class AudioTask:
     """Represents a queued audio transcription task."""
+
     message: Message
     file_obj: Any
     filename: str
@@ -292,6 +295,7 @@ def get_pending_jobs() -> list[Job]:
 def get_in_progress_jobs() -> list[Job]:
     """Get jobs currently being processed."""
     return [j for j in _jobs.values() if j.status == JobStatus.IN_PROGRESS]
+
 
 # Cache for available models
 _available_models: list[str] = []
@@ -531,9 +535,9 @@ async def document_handler(message: Message, state: FSMContext) -> None:
     print(f"Queued document task (job: {job.id}), queue size: {audio_queue.qsize()}", flush=True)
 
 
-
 class APIError(Exception):
     """Custom exception for API errors that may warrant retry."""
+
     def __init__(self, message: str, is_retryable: bool = True):
         super().__init__(message)
         self.is_retryable = is_retryable
@@ -571,36 +575,36 @@ def is_api_down_too_long() -> bool:
 async def transcribe_audio_chunk(
     audio_chunk: AudioSegment,
     model: str,
-) -> AsyncGenerator[str, None]:
+) -> AsyncGenerator[str]:
     """Transcribe a single audio chunk using SSE streaming and yield accumulated text.
-    
+
     Expected SSE Protocol from Backend:
     ----------------------------------
     The backend should send Server-Sent Events (SSE) with the following format:
-    
+
     Content-Type: text/event-stream
-    
+
     Events:
     - Progress updates: `data: {"data": "transcribed text segment"}`
       OR raw text:      `data: transcribed text segment`
     - Completion:       `data: [DONE]`
     - Errors:           `data: [Error: error message here]`
-    
+
     Example stream:
         data: {"data": "Hello, "}
         data: {"data": "world!"}
         data: [DONE]
-    
+
     OR (for backends like glm-asr that send raw text):
-        data: Hello, 
+        data: Hello,
         data: world!
         data: [DONE]
-    
+
     Notes:
     - Each event is on its own line, prefixed with "data: "
     - Events are separated by newlines
     - JSON format is preferred but raw text is accepted as fallback
-    - The function yields accumulated text (not incremental), so callers 
+    - The function yields accumulated text (not incremental), so callers
       can display the full transcription at any point
     """
     global _api_healthy, _api_first_failure_time
@@ -631,15 +635,15 @@ async def transcribe_audio_chunk(
 
                 async for chunk in resp.aiter_text():
                     results = parser.feed(chunk)
-                    
+
                     for result in results:
                         if result.error:
                             raise APIError(f"Transcription error: {result.error}", is_retryable=True)
-                        
+
                         if result.is_done:
                             yield parser.get_text()
                             return
-                        
+
                         # Yield current accumulated text for streaming updates
                         if result.accumulated_text:
                             yield result.accumulated_text.strip()
@@ -655,17 +659,19 @@ async def transcribe_audio_chunk(
                 yield parser.get_text()
 
     except httpx.ConnectError as e:
-        raise APIError(f"Connection failed: {e}", is_retryable=True)
+        raise APIError(f"Connection failed: {e}", is_retryable=True) from e
     except httpx.TimeoutException as e:
-        raise APIError(f"Request timeout: {e}", is_retryable=True)
+        raise APIError(f"Request timeout: {e}", is_retryable=True) from e
     except httpx.HTTPStatusError as e:
         # 5xx errors are retryable, 4xx are not (except 429)
         if e.response.status_code >= 500 or e.response.status_code == 429:
-            raise APIError(f"Server error {e.response.status_code}: {e}", is_retryable=True)
+            raise APIError(f"Server error {e.response.status_code}: {e}", is_retryable=True) from e
         else:
-            raise APIError(f"Client error {e.response.status_code}: {e}", is_retryable=False)
+            raise APIError(f"Client error {e.response.status_code}: {e}", is_retryable=False) from e
+    except APIError:
+        raise
     except Exception as e:
-        raise APIError(f"Unexpected error: {e}", is_retryable=True)
+        raise APIError(f"Unexpected error: {e}", is_retryable=True) from e
 
 
 async def process_audio(message: Message, file_obj: Any, filename: str, job: Job | None = None) -> None:
@@ -686,15 +692,15 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
         # Try to edit existing status message
         try:
             status_msg = await bot.edit_message_text(
-                f"Processing: {filename}\n"
-                f"Model: {model_short}{retry_info}",
+                f"Processing: {filename}\n" f"Model: {model_short}{retry_info}",
                 chat_id=message.chat.id,
                 message_id=job.status_message_id,
             )
+
             # Create a mock message object with the message_id for editing
             class StatusMessage:
                 def __init__(self, chat_id: int, message_id: int):
-                    self.chat = type('obj', (object,), {'id': chat_id})()
+                    self.chat = type("obj", (object,), {"id": chat_id})()
                     self.message_id = message_id
 
                 async def edit_text(self, text: str):
@@ -704,15 +710,13 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
         except Exception:
             # Message might be deleted, create new one
             status_msg = await message.reply(
-                f"Processing: {filename}\n"
-                f"Model: {model_short}{retry_info}",
+                f"Processing: {filename}\n" f"Model: {model_short}{retry_info}",
             )
             if job:
                 update_job(job, status_message_id=status_msg.message_id)
     else:
         status_msg = await message.reply(
-            f"Processing: {filename}\n"
-            f"Model: {model_short}{retry_info}",
+            f"Processing: {filename}\n" f"Model: {model_short}{retry_info}",
         )
         if job:
             update_job(job, status_message_id=status_msg.message_id)
@@ -735,29 +739,29 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
         finalized_length = 0  # Length of text in completed (full) messages
         last_update_time = 0
         full_text = ""  # Complete accumulated text
-        
+
         async for partial_text in transcribe_audio_chunk(audio, model):
             full_text = partial_text
             # Calculate what goes in current message (text after finalized portion)
             current_msg_text = partial_text[finalized_length:]
-            
+
             # Check if we need to split into a new message
             while len(current_msg_text) > TELEGRAM_MESSAGE_LIMIT:
                 # Find split point at word boundary
                 split_idx = current_msg_text.rfind(" ", 0, TELEGRAM_MESSAGE_LIMIT)
                 if split_idx == -1:
                     split_idx = TELEGRAM_MESSAGE_LIMIT
-                
+
                 # Finalize the current message with the first part
                 finalized_chunk = current_msg_text[:split_idx]
                 try:
                     await all_messages[-1].edit_text(finalized_chunk)
                 except TelegramBadRequest:
                     pass
-                
+
                 # Track how much text is now finalized
                 finalized_length += split_idx
-                
+
                 # Get remaining text for new message
                 current_msg_text = current_msg_text[split_idx:].lstrip()
                 # Recalculate finalized_length based on current position in full text.
@@ -765,7 +769,7 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
                 # split_idx to finalized_length. Instead, compute how much of partial_text
                 # is NOT in current_msg_text - that's everything that's been finalized.
                 finalized_length = len(partial_text) - len(current_msg_text)
-                
+
                 # Create new message for overflow
                 if current_msg_text:
                     try:
@@ -774,21 +778,25 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
                     except TelegramBadRequest as e:
                         # Failed to create new message, log and continue with existing messages
                         print(f"Failed to create new message for overflow: {e}", flush=True)
-            
+
             # Throttle updates on current message
             now = time.time()
             if now - last_update_time >= MESSAGE_UPDATE_THROTTLE_SEC and current_msg_text:
                 try:
                     # Show streaming indicator on current message
-                    display_text = current_msg_text + " ⏳" if len(current_msg_text) < TELEGRAM_MESSAGE_LIMIT - 10 else current_msg_text
+                    display_text = (
+                        current_msg_text + " ⏳"
+                        if len(current_msg_text) < TELEGRAM_MESSAGE_LIMIT - 10
+                        else current_msg_text
+                    )
                     await all_messages[-1].edit_text(display_text)
                 except TelegramBadRequest:
                     pass  # Message not modified or other Telegram API error
                 last_update_time = now
-        
+
         # Final result handling - get final current message text
         final_current_text = full_text[finalized_length:] if full_text else ""
-        
+
         if finalized_length == 0 and not final_current_text.strip():
             await all_messages[-1].edit_text("No speech detected.")
         elif final_current_text.strip():
@@ -800,13 +808,10 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
         elif finalized_length > 0 and len(all_messages) > 1:
             # Edge case: transcription exactly filled previous message(s), leaving
             # current message empty or whitespace-only. The last message was created
-            # with overflow text + streaming indicator, but after lstrip the final 
+            # with overflow text + streaming indicator, but after lstrip the final
             # segment is empty. Delete the empty trailing message.
             try:
-                await bot.delete_message(
-                    chat_id=all_messages[-1].chat.id,
-                    message_id=all_messages[-1].message_id
-                )
+                await bot.delete_message(chat_id=all_messages[-1].chat.id, message_id=all_messages[-1].message_id)
             except TelegramBadRequest:
                 pass  # Message already deleted or can't be deleted
 
@@ -840,10 +845,7 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
                     )
             else:
                 fail_job(job, str(e), should_archive=True)
-                await status_msg.edit_text(
-                    f"Transcription failed (non-retryable error).\n"
-                    f"Error: {str(e)[:200]}"
-                )
+                await status_msg.edit_text(f"Transcription failed (non-retryable error).\n" f"Error: {str(e)[:200]}")
         else:
             await status_msg.edit_text(f"Error processing {filename}:\n{str(e)}")
         raise  # Re-raise for the worker to handle
@@ -860,8 +862,7 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
                 )
             else:
                 await status_msg.edit_text(
-                    f"Transcription failed after {MAX_RETRIES} attempts.\n"
-                    f"Job archived. Last error: {str(e)[:200]}"
+                    f"Transcription failed after {MAX_RETRIES} attempts.\n" f"Job archived. Last error: {str(e)[:200]}"
                 )
         else:
             await status_msg.edit_text(f"Error processing {filename}:\n{str(e)}")
@@ -923,8 +924,8 @@ async def retry_scheduler() -> None:
                 # We need to reconstruct enough context to process the job
                 class MockMessage:
                     def __init__(self, job: Job):
-                        self.from_user = type('obj', (object,), {'id': job.user_id})()
-                        self.chat = type('obj', (object,), {'id': job.chat_id})()
+                        self.from_user = type("obj", (object,), {"id": job.user_id})()
+                        self.chat = type("obj", (object,), {"id": job.chat_id})()
                         self.message_id = job.message_id
 
                     async def reply(self, text: str):
