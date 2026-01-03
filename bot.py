@@ -267,12 +267,15 @@ def schedule_retry(job: Job, error: str) -> bool:
 
 
 def get_pending_jobs() -> list[Job]:
-    """Get jobs that are pending or ready for retry."""
+    """Get jobs that are pending (stale) or ready for retry."""
     now = time.time()
     ready = []
     for job in _jobs.values():
         if job.status == JobStatus.PENDING:
-            ready.append(job)
+            # Only pick up pending jobs if they've been pending for > 60s
+            # This prevents race conditions with the initial queueing
+            if (now - job.created_at) > 60:
+                ready.append(job)
         elif job.status == JobStatus.RETRY and job.next_retry_at and job.next_retry_at <= now:
             ready.append(job)
     return sorted(ready, key=lambda j: j.created_at)
