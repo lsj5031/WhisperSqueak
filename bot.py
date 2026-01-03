@@ -751,13 +751,27 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
         if not result_text or not result_text.strip():
             await status_msg.edit_text("No speech detected.")
         elif len(result_text) > 4000:
+            # Smart split by nearest whitespace to avoid cutting words
+            chunks = []
+            text_to_process = result_text
+            while len(text_to_process) > 4000:
+                # Find nearest space before limit (reserve a bit of buffer)
+                split_idx = text_to_process.rfind(" ", 0, 4000)
+                if split_idx == -1:
+                    # No space found, force split at limit
+                    split_idx = 4000
+                
+                chunks.append(text_to_process[:split_idx])
+                text_to_process = text_to_process[split_idx:].strip()
+            
+            if text_to_process:
+                chunks.append(text_to_process)
+
             # Update the status message with first part
-            await status_msg.edit_text(result_text[:4000])
+            await status_msg.edit_text(chunks[0])
+            
             # Send remaining parts as new messages
-            remaining = result_text[4000:]
-            while remaining:
-                chunk = remaining[:4000]
-                remaining = remaining[4000:]
+            for chunk in chunks[1:]:
                 await message.reply(chunk)
         else:
             try:
