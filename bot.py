@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
@@ -566,8 +566,8 @@ def is_api_down_too_long() -> bool:
 async def transcribe_audio_chunk(
     audio_chunk: AudioSegment,
     model: str,
-) -> str:
-    """Transcribe a single audio chunk using SSE streaming and return complete text."""
+) -> AsyncGenerator[str, None]:
+    """Transcribe a single audio chunk using SSE streaming and yield accumulated text."""
     global _api_healthy, _api_first_failure_time
 
     mp3_buffer = io.BytesIO()
@@ -612,7 +612,8 @@ async def transcribe_audio_chunk(
 
                         # Check for completion sentinel
                         if data_str == "[DONE]":
-                            return accumulated_text.strip()
+                            yield accumulated_text.strip()
+                            return
 
                         # Check for error sentinel
                         if data_str.startswith("[Error:"):
@@ -629,9 +630,11 @@ async def transcribe_audio_chunk(
                             text = data.get("data", "")
                             if text:
                                 accumulated_text += text
+                                yield accumulated_text.strip()
                         except json.JSONDecodeError:
                             # If not JSON, treat raw data as text
                             accumulated_text += data_str
+                            yield accumulated_text.strip()
 
                 # Handle any remaining buffer content (shouldn't happen with proper SSE stream)
                 if buffer.strip():
@@ -639,7 +642,8 @@ async def transcribe_audio_chunk(
                     if line.startswith("data:"):
                         data_str = line[5:].strip()
                         if data_str == "[DONE]":
-                            return accumulated_text.strip()
+                            yield accumulated_text.strip()
+                            return
                         if not data_str.startswith("[Error:"):
                             try:
                                 data = json.loads(data_str)
@@ -648,8 +652,10 @@ async def transcribe_audio_chunk(
                                     accumulated_text += text
                             except json.JSONDecodeError:
                                 accumulated_text += data_str
+                            
+                            yield accumulated_text.strip()
 
-                return accumulated_text.strip()
+                yield accumulated_text.strip()
 
     except httpx.ConnectError as e:
         raise APIError(f"Connection failed: {e}", is_retryable=True)
@@ -746,7 +752,34 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
             all_messages = [status_msg]  # Track all messages for final cleanup
 
             for i, chunk in enumerate(chunks, 1):
-                chunk_text = await transcribe_audio_chunk(chunk, model)
+                chunk_final_text = ""
+                last_update_time = 0
+                
+                async for partial_text in transcribe_audio_chunk(chunk, model):
+                    chunk_final_text = partial_text
+                    
+                    # Throttle updates to avoid hitting API limits (max 1 update/sec)
+                    now = time.time()
+                    if now - last_update_time >= 1.0:
+                        # Construct display text
+                        display_text = current_text 
+                        if display_text:
+                            display_text += " " + partial_text
+                        else:
+                            display_text = partial_text
+                            
+                        display_text += f"\n\n[{i}/{total_chunks}]"
+                        
+                        try:
+                            if len(display_text) <= 4000:
+                                await current_msg.edit_text(display_text)
+                        except Exception:
+                            pass
+                        
+                        last_update_time = now
+
+                # Chunk complete
+                chunk_text = chunk_final_text
                 if chunk_text:
                     if current_text:
                         current_text += " " + chunk_text
@@ -773,7 +806,22 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
                 final_text = current_text[:4000] if len(current_text) > 4000 else current_text
                 await current_msg.edit_text(final_text)
         else:
-            result_text = await transcribe_audio_chunk(audio, model)
+            result_text = ""
+            last_update_time = 0
+            
+            async for partial_text in transcribe_audio_chunk(audio, model):
+                result_text = partial_text
+                
+                # Throttle updates
+                now = time.time()
+                if now - last_update_time >= 1.0:
+                    try:
+                        if len(result_text) <= 4000:
+                            await status_msg.edit_text(result_text)
+                    except Exception:
+                        pass
+                    last_update_time = now
+            
             if not result_text or not result_text.strip():
                 await status_msg.edit_text("No speech detected.")
             elif len(result_text) > 4000:
