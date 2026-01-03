@@ -626,9 +626,9 @@ async def transcribe_audio_chunk(
                             text = data.get("data", "")
                             if text:
                                 accumulated_text += text
-                        except json.JSONDecodeError as e:
-                            print(f"Failed to parse SSE data: {data_str}, error: {e}", flush=True)
-                            continue
+                        except json.JSONDecodeError:
+                            # If not JSON, treat raw data as text
+                            accumulated_text += data_str
 
                 # Handle any remaining buffer content (shouldn't happen with proper SSE stream)
                 if buffer.strip():
@@ -644,7 +644,7 @@ async def transcribe_audio_chunk(
                                 if text:
                                     accumulated_text += text
                             except json.JSONDecodeError:
-                                pass
+                                accumulated_text += data_str
 
                 return accumulated_text.strip()
 
