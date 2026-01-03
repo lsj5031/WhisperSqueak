@@ -512,7 +512,7 @@ async def document_handler(message: Message, state: FSMContext) -> None:
     print(f"Queued document task (job: {job.id}), queue size: {audio_queue.qsize()}", flush=True)
 
 
-CHUNK_DURATION_MS = 60 * 1000  # 1 minute chunks
+CHUNK_DURATION_MS = 30 * 1000  # 30 second chunks (updated for SSE backend)
 CHUNK_OVERLAP_MS = 2 * 1000   # 2 second overlap to avoid word breaks
 
 
@@ -556,31 +556,69 @@ async def transcribe_audio_chunk(
     audio_chunk: AudioSegment,
     model: str,
 ) -> str:
-    """Transcribe a single audio chunk using httpx."""
+    """Transcribe a single audio chunk using SSE streaming."""
     global _api_healthy, _api_first_failure_time
 
     mp3_buffer = io.BytesIO()
     audio_chunk.export(mp3_buffer, format="mp3")
     mp3_buffer.seek(0)
 
-    form_data = {"model": model, "response_format": "json"}
+    form_data = {"model": model, "stream": "true"}
 
     try:
         async with httpx.AsyncClient(timeout=300) as http:
-            resp = await http.post(
+            async with http.stream(
+                "POST",
                 f"{WHISPER_URL}/audio/transcriptions",
                 headers={"Authorization": f"Bearer {WHISPER_API_KEY}"},
                 data=form_data,
                 files={"file": ("audio.mp3", mp3_buffer, "audio/mpeg")},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            ) as resp:
+                resp.raise_for_status()
 
-            # API is healthy
-            _api_healthy = True
-            _api_first_failure_time = None
+                # API is healthy
+                _api_healthy = True
+                _api_first_failure_time = None
 
-            return data.get("text", "").strip()
+                # Accumulate text from SSE stream
+                accumulated_text = ""
+                buffer = ""
+
+                async for chunk in resp.aiter_text():
+                    buffer += chunk
+
+                    # Split by newlines to get SSE events
+                    lines = buffer.split("\n")
+                    buffer = lines[-1]  # Keep incomplete line in buffer
+
+                    for line in lines[:-1]:
+                        line = line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+
+                        # Extract data value
+                        data_str = line[5:].strip()
+
+                        # Check for completion sentinel
+                        if data_str == "[DONE]":
+                            return accumulated_text.strip()
+
+                        # Check for error sentinel
+                        if data_str.startswith("[Error:"):
+                            error_msg = data_str[7:-1] if data_str.endswith("]") else data_str[7:]
+                            raise APIError(f"Transcription error: {error_msg}", is_retryable=True)
+
+                        # Parse JSON data
+                        try:
+                            data = json.loads(data_str)
+                            text = data.get("data", "")
+                            if text:
+                                accumulated_text += text
+                        except json.JSONDecodeError as e:
+                            print(f"Failed to parse SSE data: {data_str}, error: {e}", flush=True)
+                            continue
+
+                return accumulated_text.strip()
 
     except httpx.ConnectError as e:
         raise APIError(f"Connection failed: {e}", is_retryable=True)
