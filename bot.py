@@ -523,9 +523,6 @@ async def document_handler(message: Message, state: FSMContext) -> None:
     print(f"Queued document task (job: {job.id}), queue size: {audio_queue.qsize()}", flush=True)
 
 
-CHUNK_DURATION_MS = 30 * 1000  # 30 second chunks (updated for SSE backend)
-CHUNK_OVERLAP_MS = 2 * 1000   # 2 second overlap to avoid word breaks
-
 
 class APIError(Exception):
     """Custom exception for API errors that may warrant retry."""
@@ -733,106 +730,40 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
         duration_sec = len(audio) / 1000
         print(f"Audio duration: {duration_sec:.1f}s", flush=True)
 
-        # Split into chunks if longer than 1 minute
-        if len(audio) > CHUNK_DURATION_MS:
-            chunks = []
-            step = CHUNK_DURATION_MS - CHUNK_OVERLAP_MS  # Step with overlap
-            for i in range(0, len(audio), step):
-                chunk_end = min(i + CHUNK_DURATION_MS, len(audio))
-                chunks.append(audio[i:chunk_end])
-                if chunk_end >= len(audio):
-                    break
-
-            total_chunks = len(chunks)
-            print(f"Split into {total_chunks} chunks", flush=True)
-
-            # Progressive display - append results as they come
-            current_text = ""
-            current_msg = status_msg
-            all_messages = [status_msg]  # Track all messages for final cleanup
-
-            for i, chunk in enumerate(chunks, 1):
-                chunk_final_text = ""
-                last_update_time = 0
-                
-                async for partial_text in transcribe_audio_chunk(chunk, model):
-                    chunk_final_text = partial_text
-                    
-                    # Throttle updates to avoid hitting API limits (max 1 update/sec)
-                    now = time.time()
-                    if now - last_update_time >= 1.0:
-                        # Construct display text
-                        display_text = current_text 
-                        if display_text:
-                            display_text += " " + partial_text
-                        else:
-                            display_text = partial_text
-                            
-                        display_text += f"\n\n[{i}/{total_chunks}]"
-                        
-                        try:
-                            if len(display_text) <= 4000:
-                                await current_msg.edit_text(display_text)
-                        except Exception:
-                            pass
-                        
-                        last_update_time = now
-
-                # Chunk complete
-                chunk_text = chunk_final_text
-                if chunk_text:
-                    if current_text:
-                        current_text += " " + chunk_text
-                    else:
-                        current_text = chunk_text
-
-                print(f"Chunk {i}/{total_chunks} done", flush=True)
-
-                # Check if we need to start a new message
-                display_text = current_text + f"\n\n[{i}/{total_chunks}]"
-
-                if len(display_text) <= 4000:
-                    await current_msg.edit_text(display_text)
-                else:
-                    # Finalize current message (remove progress indicator)
-                    await current_msg.edit_text(current_text[:4000] if len(current_text) > 4000 else current_text)
-                    # Start new message with the overflow
-                    current_text = chunk_text  # Start fresh with just this chunk
-                    current_msg = await message.reply(current_text + f"\n\n[{i}/{total_chunks}]")
-                    all_messages.append(current_msg)
-
-            # Final update - remove progress indicator from last message
-            if current_text:
-                final_text = current_text[:4000] if len(current_text) > 4000 else current_text
-                await current_msg.edit_text(final_text)
+        result_text = ""
+        last_update_time = 0
+        
+        async for partial_text in transcribe_audio_chunk(audio, model):
+            result_text = partial_text
+            
+            # Throttle updates
+            now = time.time()
+            if now - last_update_time >= 1.0:
+                try:
+                    # Only update if <= 4000 to avoid errors during streaming
+                    if len(result_text) <= 4000:
+                        await status_msg.edit_text(result_text)
+                except Exception:
+                    pass
+                last_update_time = now
+        
+        # Final result handling
+        if not result_text or not result_text.strip():
+            await status_msg.edit_text("No speech detected.")
+        elif len(result_text) > 4000:
+            # Update the status message with first part
+            await status_msg.edit_text(result_text[:4000])
+            # Send remaining parts as new messages
+            remaining = result_text[4000:]
+            while remaining:
+                chunk = remaining[:4000]
+                remaining = remaining[4000:]
+                await message.reply(chunk)
         else:
-            result_text = ""
-            last_update_time = 0
-            
-            async for partial_text in transcribe_audio_chunk(audio, model):
-                result_text = partial_text
-                
-                # Throttle updates
-                now = time.time()
-                if now - last_update_time >= 1.0:
-                    try:
-                        if len(result_text) <= 4000:
-                            await status_msg.edit_text(result_text)
-                    except Exception:
-                        pass
-                    last_update_time = now
-            
-            if not result_text or not result_text.strip():
-                await status_msg.edit_text("No speech detected.")
-            elif len(result_text) > 4000:
-                await status_msg.edit_text(result_text[:4000])
-                remaining = result_text[4000:]
-                while remaining:
-                    chunk = remaining[:4000]
-                    remaining = remaining[4000:]
-                    await message.reply(chunk)
-            else:
+            try:
                 await status_msg.edit_text(result_text)
+            except Exception:
+                pass # Ignore if message not modified
 
         # Job completed successfully
         if job:
