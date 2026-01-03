@@ -359,9 +359,17 @@ def get_filtered_models() -> list[tuple[int, str]]:
 
 
 def get_user_model(user_id: int) -> str:
-    """Get model from persistent storage."""
+    """Get model from persistent storage, validating against available models."""
     prefs = get_user_prefs(user_id)
-    return prefs.get("model", DEFAULT_MODEL)
+    model = prefs.get("model", DEFAULT_MODEL)
+
+    # If we have available models and the selected one isn't in the list,
+    # fallback to the first available model
+    if _available_models and model not in _available_models:
+        print(f"Model {model} not available, falling back to {_available_models[0]}", flush=True)
+        return _available_models[0]
+
+    return model
 
 
 @router.message(Command("start"))
