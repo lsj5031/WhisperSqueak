@@ -571,7 +571,7 @@ async def transcribe_audio_chunk(
     audio_chunk.export(mp3_buffer, format="mp3")
     mp3_buffer.seek(0)
 
-    form_data = {"model": model, "response_format": "json", "stream": "true"}
+    form_data = {"model": model, "stream": "true"}
 
     try:
         async with httpx.AsyncClient(timeout=300) as http:
