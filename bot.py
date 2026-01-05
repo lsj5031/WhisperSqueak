@@ -158,7 +158,7 @@ def save_user_settings(settings: dict) -> None:
         print(f"Failed to save settings: {e}", flush=True)
 
 
-DEFAULT_MODEL = "Systran/faster-whisper-large-v3"
+DEFAULT_MODEL = "zai-org/GLM-ASR-Nano-2512"
 
 
 def get_user_prefs(user_id: int) -> dict:
@@ -302,6 +302,7 @@ _available_models: list[str] = []
 
 # Popular models to show first (in priority order)
 POPULAR_MODELS = [
+    "zai-org/GLM-ASR-Nano-2512",
     "Systran/faster-whisper-large-v3",
     "Systran/faster-whisper-medium",
     "Systran/faster-whisper-small",
@@ -692,7 +693,7 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
         # Try to edit existing status message
         try:
             status_msg = await bot.edit_message_text(
-                f"Processing: {filename}\n" f"Model: {model_short}{retry_info}",
+                f"Processing: {filename}\nModel: {model_short}{retry_info}",
                 chat_id=message.chat.id,
                 message_id=job.status_message_id,
             )
@@ -710,13 +711,13 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
         except Exception:
             # Message might be deleted, create new one
             status_msg = await message.reply(
-                f"Processing: {filename}\n" f"Model: {model_short}{retry_info}",
+                f"Processing: {filename}\nModel: {model_short}{retry_info}",
             )
             if job:
                 update_job(job, status_message_id=status_msg.message_id)
     else:
         status_msg = await message.reply(
-            f"Processing: {filename}\n" f"Model: {model_short}{retry_info}",
+            f"Processing: {filename}\nModel: {model_short}{retry_info}",
         )
         if job:
             update_job(job, status_message_id=status_msg.message_id)
@@ -741,9 +742,14 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
         full_text = ""  # Complete accumulated text
 
         async for partial_text in transcribe_audio_chunk(audio, model):
-            full_text = partial_text
+            # Handle empty transcription sentinel
+            if partial_text == "[Empty transcription]":
+                full_text = ""
+            else:
+                full_text = partial_text
+
             # Calculate what goes in current message (text after finalized portion)
-            current_msg_text = partial_text[finalized_length:]
+            current_msg_text = full_text[finalized_length:]
 
             # Check if we need to split into a new message
             while len(current_msg_text) > TELEGRAM_MESSAGE_LIMIT:
@@ -827,8 +833,7 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
                 if is_api_down_too_long():
                     fail_job(job, f"API down for over 1 hour: {e}", should_archive=True)
                     await status_msg.edit_text(
-                        f"Transcription failed - API unavailable for over 1 hour.\n"
-                        f"Job archived. Error: {str(e)[:200]}"
+                        f"Transcription failed - API unavailable for over 1 hour.\nJob archived. Error: {str(e)[:200]}"
                     )
                 elif schedule_retry(job, str(e)):
                     delay = calculate_retry_delay(job.retry_count)
@@ -840,12 +845,11 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
                 else:
                     # Max retries exceeded
                     await status_msg.edit_text(
-                        f"Transcription failed after {MAX_RETRIES} attempts.\n"
-                        f"Job archived. Last error: {str(e)[:200]}"
+                        f"Transcription failed after {MAX_RETRIES} attempts.\nJob archived. Last error: {str(e)[:200]}"
                     )
             else:
                 fail_job(job, str(e), should_archive=True)
-                await status_msg.edit_text(f"Transcription failed (non-retryable error).\n" f"Error: {str(e)[:200]}")
+                await status_msg.edit_text(f"Transcription failed (non-retryable error).\nError: {str(e)[:200]}")
         else:
             await status_msg.edit_text(f"Error processing {filename}:\n{str(e)}")
         raise  # Re-raise for the worker to handle
@@ -862,7 +866,7 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
                 )
             else:
                 await status_msg.edit_text(
-                    f"Transcription failed after {MAX_RETRIES} attempts.\n" f"Job archived. Last error: {str(e)[:200]}"
+                    f"Transcription failed after {MAX_RETRIES} attempts.\nJob archived. Last error: {str(e)[:200]}"
                 )
         else:
             await status_msg.edit_text(f"Error processing {filename}:\n{str(e)}")
