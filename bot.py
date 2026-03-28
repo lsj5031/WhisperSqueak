@@ -1,7 +1,9 @@
 import asyncio
 import io
 import json
+import logging
 import os
+import sys
 import time
 import uuid
 from collections.abc import AsyncGenerator
@@ -18,10 +20,19 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiohttp import web
 from dotenv import load_dotenv
 from pydub import AudioSegment
 
 from sse_parser import SSEParser
+
+# Structured logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("whispersqueak")
 
 load_dotenv()
 
@@ -92,7 +103,7 @@ def load_jobs() -> dict[str, Job]:
             data = json.loads(JOBS_FILE.read_text())
             return {k: Job.from_dict(v) for k, v in data.items()}
         except Exception as e:
-            print(f"Failed to load jobs: {e}", flush=True)
+            logger.warning(f"Failed to load jobs: {e}")
     return {}
 
 
@@ -103,7 +114,7 @@ def save_jobs(jobs: dict[str, Job]) -> None:
         JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
         JOBS_FILE.write_text(json.dumps(data, indent=2))
     except Exception as e:
-        print(f"Failed to save jobs: {e}", flush=True)
+        logger.warning(f"Failed to save jobs: {e}")
 
 
 def load_archive() -> list[dict]:
@@ -126,9 +137,9 @@ def archive_job(job: Job, reason: str) -> None:
         archive.append(archive_entry)
         ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
         ARCHIVE_FILE.write_text(json.dumps(archive, indent=2))
-        print(f"Archived job {job.id}: {reason}", flush=True)
+        logger.info(f"Archived job {job.id}: {reason}")
     except Exception as e:
-        print(f"Failed to archive job: {e}", flush=True)
+        logger.warning(f"Failed to archive job: {e}")
 
 
 # Global job storage
@@ -155,7 +166,7 @@ def save_user_settings(settings: dict) -> None:
     try:
         SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
     except Exception as e:
-        print(f"Failed to save settings: {e}", flush=True)
+        logger.warning(f"Failed to save settings: {e}")
 
 
 DEFAULT_MODEL = "zai-org/GLM-ASR-Nano-2512"
@@ -182,6 +193,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 WHISPER_URL = os.getenv("WHISPER_URL", "http://host.docker.internal:18000/v1")
 WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "dummy")
 ALLOWED_UIDS = [int(uid.strip()) for uid in os.getenv("ALLOWED_UIDS", "").split(",") if uid.strip()]
+TELEGRAM_API_URL = os.getenv("TELEGRAM_API_URL")
 
 if not TOKEN:
     raise ValueError("TELEGRAM_TOKEN env var required")
@@ -189,7 +201,25 @@ if not TOKEN:
 if not ALLOWED_UIDS:
     raise ValueError("ALLOWED_UIDS env var required (comma-separated user IDs)")
 
-bot = Bot(token=TOKEN)
+# Initialize bot with optional local API server for large file support
+if TELEGRAM_API_URL:
+    from aiogram.client.session.aiohttp import AiohttpSession
+    from aiogram.client.telegram import SimpleFilesPathWrapper, TelegramAPIServer
+
+    logger.info(f"Using Telegram API local server: {TELEGRAM_API_URL}")
+    session = AiohttpSession(
+        api=TelegramAPIServer.from_base(
+            TELEGRAM_API_URL,
+            is_local=True,
+            wrap_local_file=SimpleFilesPathWrapper(
+                server_path=Path("/var/lib/telegram-bot-api"),
+                local_path=Path("/var/lib/telegram-bot-api"),
+            ),
+        )
+    )
+    bot = Bot(token=TOKEN, session=session)
+else:
+    bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
@@ -222,7 +252,7 @@ def create_job(message: Message, file_obj: Any, filename: str) -> Job:
     )
     _jobs[job.id] = job
     save_jobs(_jobs)
-    print(f"Created job {job.id} for {filename}", flush=True)
+    logger.info(f"Created job {job.id} for {filename}")
     return job
 
 
@@ -241,7 +271,7 @@ def complete_job(job: Job) -> None:
     job.updated_at = time.time()
     del _jobs[job.id]
     save_jobs(_jobs)
-    print(f"Completed job {job.id}", flush=True)
+    logger.info(f"Completed job {job.id}")
 
 
 def fail_job(job: Job, error: str, should_archive: bool = False) -> None:
@@ -255,7 +285,7 @@ def fail_job(job: Job, error: str, should_archive: bool = False) -> None:
         job.status = JobStatus.ARCHIVED
         del _jobs[job.id]
     save_jobs(_jobs)
-    print(f"Failed job {job.id}: {error}", flush=True)
+    logger.warning(f"Failed job {job.id}: {error}")
 
 
 def schedule_retry(job: Job, error: str) -> bool:
@@ -273,7 +303,7 @@ def schedule_retry(job: Job, error: str) -> bool:
     job.updated_at = time.time()
     save_jobs(_jobs)
 
-    print(f"Scheduled retry {job.retry_count}/{MAX_RETRIES} for job {job.id} in {delay:.0f}s", flush=True)
+    logger.info(f"Scheduled retry {job.retry_count}/{MAX_RETRIES} for job {job.id} in {delay:.0f}s")
     return True
 
 
@@ -339,7 +369,7 @@ async def fetch_available_models(force_refresh: bool = False) -> list[str]:
                 _available_models = models
                 return models
     except Exception as e:
-        print(f"Failed to fetch models: {e}", flush=True)
+        logger.warning(f"Failed to fetch models: {e}")
 
     # Fallback to common models if nothing cached
     if not _available_models:
@@ -382,7 +412,7 @@ def get_user_model(user_id: int) -> str:
     # If we have available models and the selected one isn't in the list,
     # fallback to the first available model
     if _available_models and model not in _available_models:
-        print(f"Model {model} not available, falling back to {_available_models[0]}", flush=True)
+        logger.warning(f"Model {model} not available, falling back to {_available_models[0]}")
         return _available_models[0]
 
     return model
@@ -391,7 +421,7 @@ def get_user_model(user_id: int) -> str:
 @router.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext) -> None:
     uid = message.from_user.id
-    print(f"User {uid} started WhisperSqueak", flush=True)
+    logger.info(f"User {uid} started WhisperSqueak")
     if not is_allowed(uid):
         await message.answer("Access denied. Contact admin.")
         return
@@ -482,7 +512,7 @@ async def process_model(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(F.voice)
 async def voice_handler(message: Message, state: FSMContext) -> None:
-    print(f"Received voice from {message.from_user.id}", flush=True)
+    logger.info(f"Received voice from {message.from_user.id}")
     if not is_allowed(message.from_user.id):
         await message.answer("Access denied. Contact admin.")
         return
@@ -491,12 +521,12 @@ async def voice_handler(message: Message, state: FSMContext) -> None:
     job = create_job(message, message.voice, filename)
     task = AudioTask(message=message, file_obj=message.voice, filename=filename, job_id=job.id)
     await audio_queue.put(task)
-    print(f"Queued voice task (job: {job.id}), queue size: {audio_queue.qsize()}", flush=True)
+    logger.info(f"Queued voice task (job: {job.id}), queue size: {audio_queue.qsize()}")
 
 
 @router.message(F.audio)
 async def audio_handler(message: Message, state: FSMContext) -> None:
-    print(f"Received audio from {message.from_user.id}: {message.audio.file_name}", flush=True)
+    logger.info(f"Received audio from {message.from_user.id}: {message.audio.file_name}")
     if not is_allowed(message.from_user.id):
         await message.answer("Access denied. Contact admin.")
         return
@@ -506,14 +536,14 @@ async def audio_handler(message: Message, state: FSMContext) -> None:
     job = create_job(message, audio, filename)
     task = AudioTask(message=message, file_obj=audio, filename=filename, job_id=job.id)
     await audio_queue.put(task)
-    print(f"Queued audio task (job: {job.id}), queue size: {audio_queue.qsize()}", flush=True)
+    logger.info(f"Queued audio task (job: {job.id}), queue size: {audio_queue.qsize()}")
 
 
 @router.message(F.document)
 async def document_handler(message: Message, state: FSMContext) -> None:
     doc = message.document
     mime = doc.mime_type or ""
-    print(f"Received document from {message.from_user.id}: {doc.file_name} (mime: {mime})", flush=True)
+    logger.info(f"Received document from {message.from_user.id}: {doc.file_name} (mime: {mime})")
 
     if not is_allowed(message.from_user.id):
         await message.answer("Access denied. Contact admin.")
@@ -526,14 +556,14 @@ async def document_handler(message: Message, state: FSMContext) -> None:
         is_audio = is_audio or ext in ("mp3", "wav", "ogg", "m4a", "flac", "aac", "wma", "opus")
 
     if not is_audio:
-        print(f"Skipping non-audio document: {mime}", flush=True)
+        logger.info(f"Skipping non-audio document: {mime}")
         return
 
     filename = doc.file_name or f"{doc.file_id}.audio"
     job = create_job(message, doc, filename)
     task = AudioTask(message=message, file_obj=doc, filename=filename, job_id=job.id)
     await audio_queue.put(task)
-    print(f"Queued document task (job: {job.id}), queue size: {audio_queue.qsize()}", flush=True)
+    logger.info(f"Queued document task (job: {job.id}), queue size: {audio_queue.qsize()}")
 
 
 class APIError(Exception):
@@ -556,7 +586,7 @@ async def check_api_health() -> bool:
                 _api_first_failure_time = None
                 return True
     except Exception as e:
-        print(f"API health check failed: {e}", flush=True)
+        logger.warning(f"API health check failed: {e}")
 
     # Track first failure time
     if _api_first_failure_time is None:
@@ -677,10 +707,10 @@ async def transcribe_audio_chunk(
 
 async def process_audio(message: Message, file_obj: Any, filename: str, job: Job | None = None) -> None:
     uid = message.from_user.id
-    print(f"Processing audio for user {uid}: {filename}", flush=True)
+    logger.info(f"Processing audio for user {uid}: {filename}")
 
     model = get_user_model(uid)
-    print(f"Settings - model: {model}", flush=True)
+    logger.info(f"Settings - model: {model}")
 
     model_short = model.split("/")[-1] if "/" in model else model
 
@@ -726,14 +756,17 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
     if job:
         update_job(job, status=JobStatus.IN_PROGRESS)
 
-    tg_file = await bot.get_file(file_obj.file_id)
-    file_path = Path(f"/tmp/{tg_file.file_id}")
-    await bot.download_file(tg_file.file_path, file_path)
+    # Download file using aiogram's native support
+    # With is_local=True, this reads directly from the shared volume (no HTTP)
+    # Without local server, this downloads via HTTP from Telegram's servers
+    safe_name = Path(filename).name
+    file_path = Path(f"/tmp/{file_obj.file_id[:8]}_{safe_name}")
+    await bot.download(file_obj, destination=file_path)
 
     try:
         audio = AudioSegment.from_file(file_path)
         duration_sec = len(audio) / 1000
-        print(f"Audio duration: {duration_sec:.1f}s", flush=True)
+        logger.info(f"Audio duration: {duration_sec:.1f}s")
 
         # Track all messages for multi-message streaming
         all_messages = [status_msg]  # List of message objects
@@ -783,7 +816,7 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
                         all_messages.append(new_msg)
                     except TelegramBadRequest as e:
                         # Failed to create new message, log and continue with existing messages
-                        print(f"Failed to create new message for overflow: {e}", flush=True)
+                        logger.warning(f"Failed to create new message for overflow: {e}")
 
             # Throttle updates on current message
             now = time.time()
@@ -826,7 +859,7 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
             complete_job(job)
 
     except APIError as e:
-        print(f"API error processing audio: {e}", flush=True)
+        logger.warning(f"API error processing audio: {e}")
         if job:
             if e.is_retryable:
                 # Check if API has been down too long
@@ -855,7 +888,7 @@ async def process_audio(message: Message, file_obj: Any, filename: str, job: Job
         raise  # Re-raise for the worker to handle
 
     except Exception as e:
-        print(f"Error processing audio: {e}", flush=True)
+        logger.warning(f"Error processing audio: {e}")
         if job:
             if schedule_retry(job, str(e)):
                 delay = calculate_retry_delay(job.retry_count)
@@ -890,26 +923,26 @@ def format_delay(seconds: float) -> str:
 
 async def audio_worker() -> None:
     """Worker that processes audio tasks from the queue sequentially."""
-    print("Audio worker started", flush=True)
+    logger.info("Audio worker started")
     while True:
         task = await audio_queue.get()
         try:
-            print(f"Processing queued task: {task.filename} (job: {task.job_id})", flush=True)
+            logger.info(f"Processing queued task: {task.filename} (job: {task.job_id})")
 
             # Get job if exists
             job = _jobs.get(task.job_id) if task.job_id else None
 
             await process_audio(task.message, task.file_obj, task.filename, job)
-        except (APIError, Exception) as e:
+        except (Exception, asyncio.CancelledError) as e:
             # Errors are already handled in process_audio with retry scheduling
-            print(f"Error in audio worker (handled): {e}", flush=True)
+            logger.warning(f"Error in audio worker (handled): {type(e).__name__}: {e}")
         finally:
             audio_queue.task_done()
 
 
 async def retry_scheduler() -> None:
     """Background task that checks for jobs ready for retry and re-queues them."""
-    print("Retry scheduler started", flush=True)
+    logger.info("Retry scheduler started")
 
     while True:
         await asyncio.sleep(5)  # Check every 5 seconds
@@ -922,7 +955,7 @@ async def retry_scheduler() -> None:
                 if job.status == JobStatus.IN_PROGRESS:
                     continue
 
-                print(f"Re-queuing job {job.id} for retry (attempt {job.retry_count})", flush=True)
+                logger.info(f"Re-queuing job {job.id} for retry (attempt {job.retry_count})")
 
                 # Create a mock message for re-processing
                 # We need to reconstruct enough context to process the job
@@ -951,7 +984,7 @@ async def retry_scheduler() -> None:
                 await audio_queue.put(task)
 
         except Exception as e:
-            print(f"Error in retry scheduler: {e}", flush=True)
+            logger.warning(f"Error in retry scheduler: {e}")
 
 
 async def recover_jobs() -> None:
@@ -971,26 +1004,63 @@ async def recover_jobs() -> None:
                 del _jobs[job_id]
                 continue
             job.next_retry_at = time.time() + calculate_retry_delay(job.retry_count)
-            print(f"Reset interrupted job {job.id} to retry", flush=True)
+            logger.info(f"Reset interrupted job {job.id} to retry")
 
         # Jobs in retry status will be picked up by retry_scheduler
         if job.status in (JobStatus.PENDING, JobStatus.RETRY):
             recovered += 1
-            print(f"Recovered job {job.id} ({job.filename}) - status: {job.status}", flush=True)
+            logger.info(f"Recovered job {job.id} ({job.filename}) - status: {job.status}")
 
     save_jobs(_jobs)
-    print(f"Recovered {recovered} jobs from previous session", flush=True)
+    logger.info(f"Recovered {recovered} jobs from previous session")
+
+
+async def health_check(request: web.Request) -> web.Response:
+    """Health check endpoint for container orchestration."""
+    try:
+        jobs_count = len(_jobs)
+    except Exception:
+        jobs_count = -1
+
+    try:
+        queue_size = audio_queue.qsize()
+    except Exception:
+        queue_size = -1
+
+    return web.json_response({
+        "status": "healthy",
+        "jobs_active": jobs_count,
+        "queue_size": queue_size,
+        "api_healthy": _api_healthy,
+    })
+
+
+async def start_health_server() -> None:
+    """Start a lightweight HTTP server for health checks."""
+    app = web.Application()
+    app.router.add_get("/health", health_check)
+
+    # Get port from env or use default 8080
+    port = int(os.getenv("HEALTH_PORT", "8080"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health check server started on port {port}")
 
 
 async def main() -> None:
-    print("WhisperSqueak is starting...", flush=True)
+    logger.info("WhisperSqueak is starting...")
 
     # Recover any pending jobs from previous session
     await recover_jobs()
 
-    # Pre-fetch models
-    models = await fetch_available_models()
-    print(f"Available models: {models}", flush=True)
+    # Pre-fetch models (don't crash if API is unreachable or interrupted)
+    try:
+        models = await fetch_available_models()
+        logger.info(f"Available models: {models}")
+    except (Exception, asyncio.CancelledError) as e:
+        logger.warning(f"Could not fetch models from API, using defaults: {e}")
 
     # Start audio worker for sequential processing
     asyncio.create_task(audio_worker())
@@ -998,8 +1068,14 @@ async def main() -> None:
     # Start retry scheduler for exponential backoff retries
     asyncio.create_task(retry_scheduler())
 
+    # Start health check server
+    await start_health_server()
+
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Shutting down...")
