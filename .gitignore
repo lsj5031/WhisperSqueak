@@ -39,6 +39,7 @@ env/
 
 # Data and persistence
 data/
+telegram-api-data/
 *.json
 !.env.example
 

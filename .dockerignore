@@ -1,0 +1,35 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+htmlcov
+
+# IDEs
+.idea
+.vscode
+*.swp
+*.swo
+
+# Project files
+.env
+.env.example
+README.md
+LICENSE
+tests/
+*.md
+
+# Data & temp
+data/
+telegram-api-data/
+*.log
+
+# Docker
+docker-compose.yml
+Dockerfile
