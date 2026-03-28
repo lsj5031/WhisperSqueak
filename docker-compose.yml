@@ -15,6 +15,12 @@ services:
             - /tmp:size=2G
         extra_hosts:
             - "host.docker.internal:host-gateway"
+        healthcheck:
+            test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 15s
         depends_on:
             telegram-api:
                 condition: service_healthy
