@@ -1,0 +1,47 @@
+services:
+    # WhisperSqueak Telegram Bot
+    bot:
+        build: .
+        container_name: whispersqueak
+        restart: unless-stopped
+        env_file:
+            - .env
+        volumes:
+            - ./data:/app/data
+            - ./bot.py:/app/bot.py:ro
+            - ./sse_parser.py:/app/sse_parser.py:ro
+            - ./telegram-api-data:/var/lib/telegram-bot-api:ro
+        tmpfs:
+            - /tmp:size=2G
+        extra_hosts:
+            - "host.docker.internal:host-gateway"
+        depends_on:
+            telegram-api:
+                condition: service_healthy
+        networks:
+            - whispersqueak
+
+    # Telegram Bot API Local Server (for files >20MB)
+    telegram-api:
+        image: aiogram/telegram-bot-api:latest
+        container_name: telegram-api
+        restart: unless-stopped
+        environment:
+            - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+            - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+            - TELEGRAM_LOCAL=true
+        volumes:
+            - ./telegram-api-data:/var/lib/telegram-bot-api
+        healthcheck:
+            test: ["CMD-SHELL", "wget -qS -O /dev/null http://127.0.0.1:8081 2>&1 | grep -q 'HTTP/'"]
+            interval: 10s
+            timeout: 5s
+            retries: 3
+            start_period: 10s
+        networks:
+            - whispersqueak
+
+networks:
+    whispersqueak:
+        name: whispersqueak
+        driver: bridge
